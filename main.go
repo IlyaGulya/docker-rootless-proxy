@@ -14,10 +14,6 @@ import (
 	"time"
 )
 
-const systemSocket = "/var/run/docker.sock"
-
-var rootlessSocketFormat = "/run/user/%d/docker.sock"
-
 type Connection struct {
 	logger        *zap.Logger
 	clientConn    net.Conn
@@ -184,7 +180,12 @@ func main() {
 	if err != nil {
 		panic(fmt.Sprintf("failed to initialize logger: %v", err))
 	}
-	defer logger.Sync()
+	defer func(logger *zap.Logger) {
+		err := logger.Sync()
+		if err != nil {
+			fmt.Printf("failed to flush logger: %v\n", err)
+		}
+	}(logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
