@@ -3,63 +3,32 @@ package main
 import (
 	"context"
 	"fmt"
+	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 	"io"
-	"log"
-	"log/syslog"
 	"net"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-const (
-	systemSocket         = "/var/run/docker.sock"
-	rootlessSocketFormat = "/run/user/%d/docker.sock"
-)
+const systemSocket = "/var/run/docker.sock"
 
-type Logger struct {
-	syslog *syslog.Writer
-}
-
-func NewLogger() (*Logger, error) {
-	syslogWriter, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "docker-socket-router")
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize syslog: %v", err)
-	}
-	return &Logger{syslog: syslogWriter}, nil
-}
-
-func (l *Logger) Info(format string, v ...interface{}) {
-	msg := fmt.Sprintf(format, v...)
-	if err := l.syslog.Info(msg); err != nil {
-		// If syslog fails, ensure we at least have the message in standard log
-		log.Printf("ERROR: Failed to write to syslog: %v", err)
-	}
-	log.Printf("INFO: %s", msg)
-}
-
-func (l *Logger) Error(format string, v ...interface{}) {
-	msg := fmt.Sprintf(format, v...)
-	if err := l.syslog.Err(msg); err != nil {
-		// If syslog fails, ensure we at least have the message in standard log
-		log.Printf("ERROR: Failed to write to syslog: %v", err)
-	}
-	log.Printf("ERROR: %s", msg)
-}
+var rootlessSocketFormat = "/run/user/%d/docker.sock"
 
 type Connection struct {
-	logger        *Logger
+	logger        *zap.Logger
 	clientConn    net.Conn
 	dockerConn    net.Conn
-	bytesToDocker int64
-	fromDocker    int64
+	bytesToDocker atomic.Int64
+	fromDocker    atomic.Int64
 }
 
-func (c *Connection) copyData(dst net.Conn, src net.Conn, bytes *int64) error {
+func (c *Connection) copyData(dst net.Conn, src net.Conn, bytes *atomic.Int64) error {
 	written, err := io.Copy(dst, src)
-	*bytes += written
+	bytes.Add(written)
 	return err
 }
 
@@ -78,19 +47,20 @@ func (c *Connection) handleConnection(ctx context.Context) {
 		errChan <- c.copyData(c.clientConn, c.dockerConn, &c.fromDocker)
 	}()
 
-	// Wait for either context cancellation or copy completion
 	select {
 	case <-ctx.Done():
-		c.logger.Info("Connection terminated by context")
+		c.logger.Info("connection terminated by context")
 	case err := <-errChan:
 		if err != nil && err != io.EOF {
-			c.logger.Error("Data transfer error: %v", err)
+			c.logger.Error("data transfer error", zap.Error(err))
 		}
 	}
 
 	duration := time.Since(startTime)
-	c.logger.Info("Connection closed. Duration: %v, Bytes to Docker: %d, Bytes from Docker: %d",
-		duration, c.bytesToDocker, c.fromDocker)
+	c.logger.Info("connection closed",
+		zap.Duration("duration", duration),
+		zap.Int64("bytes_to_docker", c.bytesToDocker.Load()),
+		zap.Int64("bytes_from_docker", c.fromDocker.Load()))
 }
 
 func getUserUid(conn net.Conn) (uint32, error) {
@@ -128,7 +98,7 @@ func checkExistingSocket(path string) error {
 			conn.Close()
 			return fmt.Errorf("socket %s already exists and is active", path)
 		}
-		// If we can't connect, socket might be stale but still exists
+		// Socket exists but can't connect
 		return fmt.Errorf("socket %s exists but appears to be stale. Please check if another instance is running and remove the socket file if it's not in use", path)
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("error checking socket %s: %v", path, err)
@@ -136,47 +106,30 @@ func checkExistingSocket(path string) error {
 	return nil
 }
 
-func main() {
-	logger, err := NewLogger()
-	if err != nil {
-		log.Fatalf("Failed to initialize logger: %v", err)
-	}
-
+func startRouter(ctx context.Context, config SocketConfig, logger *zap.Logger) error {
 	// Check for existing socket before proceeding
-	if err := checkExistingSocket(systemSocket); err != nil {
-		logger.Error("Startup failed: %v", err)
-		os.Exit(1)
+	if err := checkExistingSocket(config.SystemSocket); err != nil {
+		logger.Error("startup failed", zap.Error(err))
+		return err
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Handle signals for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		logger.Info("Received shutdown signal")
-		cancel()
-	}()
 
 	// Remove existing socket if present
-	os.Remove(systemSocket)
+	os.Remove(config.SystemSocket)
 
-	listener, err := net.Listen("unix", systemSocket)
+	listener, err := net.Listen("unix", config.SystemSocket)
 	if err != nil {
-		logger.Error("Failed to create listener: %v", err)
-		return
+		logger.Error("failed to create listener", zap.Error(err))
+		return err
 	}
 	defer listener.Close()
 
 	// Set socket permissions
-	if err := os.Chmod(systemSocket, 0666); err != nil {
-		logger.Error("Failed to set socket permissions: %v", err)
-		return
+	if err := os.Chmod(config.SystemSocket, 0666); err != nil {
+		logger.Error("failed to set socket permissions", zap.Error(err))
+		return err
 	}
 
-	logger.Info("Listening on %s", systemSocket)
+	logger.Info("listening", zap.String("socket", config.SystemSocket))
 
 	go func() {
 		<-ctx.Done()
@@ -187,26 +140,30 @@ func main() {
 		clientConn, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				return // Normal shutdown
+				return nil // Normal shutdown
 			}
-			logger.Error("Accept error: %v", err)
+			logger.Error("accept error", zap.Error(err))
 			continue
 		}
 
 		go func() {
 			uid, err := getUserUid(clientConn)
 			if err != nil {
-				logger.Error("Failed to get user credentials: %v", err)
+				logger.Error("failed to get user credentials", zap.Error(err))
 				clientConn.Close()
 				return
 			}
 
-			userSocket := fmt.Sprintf(rootlessSocketFormat, uid)
-			logger.Info("Connection from uid=%d, routing to %s", uid, userSocket)
+			userSocket := fmt.Sprintf(config.RootlessSocketFormat, uid)
+			logger.Info("new connection",
+				zap.Uint32("uid", uid),
+				zap.String("user_socket", userSocket))
 
 			dockerConn, err := net.Dial("unix", userSocket)
 			if err != nil {
-				logger.Error("Failed to connect to user socket %s: %v", userSocket, err)
+				logger.Error("failed to connect to user socket",
+					zap.String("socket", userSocket),
+					zap.Error(err))
 				clientConn.Close()
 				return
 			}
@@ -219,5 +176,29 @@ func main() {
 
 			conn.handleConnection(ctx)
 		}()
+	}
+}
+
+func main() {
+	logger, err := zap.NewProduction()
+	if err != nil {
+		panic(fmt.Sprintf("failed to initialize logger: %v", err))
+	}
+	defer logger.Sync()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle signals for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		logger.Info("received shutdown signal")
+		cancel()
+	}()
+
+	if err := startRouter(ctx, defaultConfig, logger); err != nil {
+		os.Exit(1)
 	}
 }

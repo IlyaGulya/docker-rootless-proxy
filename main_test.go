@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"go.uber.org/zap/zaptest"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -25,39 +28,31 @@ func TestCheckExistingSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create test socket: %v", err)
 	}
-	defer listener.Close()
 
 	err = checkExistingSocket(socketPath)
 	if err == nil {
 		t.Error("Expected error for active socket, got nil")
 	}
+	listener.Close()
 
 	// Test stale socket
-	listener.Close()
+	if err := os.WriteFile(socketPath, []byte("stale"), 0666); err != nil {
+		t.Fatalf("Failed to create stale socket file: %v", err)
+	}
+
 	err = checkExistingSocket(socketPath)
 	if err == nil {
-		t.Error("Expected error for stale socket, got nil")
+		t.Error("Expected error for stale socket")
+	} else if !strings.Contains(err.Error(), "appears to be stale") {
+		t.Errorf("Expected stale socket error, got: %v", err)
 	}
-}
-
-func TestLogger(t *testing.T) {
-	logger, err := NewLogger()
-	if err != nil {
-		t.Fatalf("Failed to create logger: %v", err)
-	}
-
-	// Test info logging
-	logger.Info("test info message")
-
-	// Test error logging
-	logger.Error("test error message")
 }
 
 func TestConnection(t *testing.T) {
-	logger, _ := NewLogger()
+	logger := zaptest.NewLogger(t)
 	tempDir := t.TempDir()
 
-	// Create mock Docker socket
+	// Set up the mock docker server
 	dockerSocket := filepath.Join(tempDir, "docker.sock")
 	dockerListener, err := net.Listen("unix", dockerSocket)
 	if err != nil {
@@ -65,74 +60,95 @@ func TestConnection(t *testing.T) {
 	}
 	defer dockerListener.Close()
 
-	// Create client socket
-	clientSocket := filepath.Join(tempDir, "client.sock")
-	clientListener, err := net.Listen("unix", clientSocket)
-	if err != nil {
-		t.Fatalf("Failed to create client socket: %v", err)
-	}
-	defer clientListener.Close()
+	// Channel to coordinate server shutdown
+	serverDone := make(chan struct{})
+	messageReceived := make(chan struct{})
 
-	// Setup test data
-	testData := []byte("test message")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Start mock Docker server
+	// Set up server handler
 	go func() {
+		defer close(serverDone)
 		conn, err := dockerListener.Accept()
 		if err != nil {
-			t.Errorf("Docker accept error: %v", err)
+			t.Errorf("docker accept error: %v", err)
 			return
 		}
 		defer conn.Close()
 
-		buf := make([]byte, len(testData))
+		// Echo server with synchronization
+		buf := make([]byte, 1024)
 		n, err := conn.Read(buf)
 		if err != nil {
-			t.Errorf("Docker read error: %v", err)
+			if err != io.EOF {
+				t.Errorf("docker read error: %v", err)
+			}
 			return
 		}
+		close(messageReceived)
 
-		// Echo back
-		conn.Write(buf[:n])
+		_, err = conn.Write(buf[:n])
+		if err != nil && err != io.EOF {
+			t.Errorf("docker write error: %v", err)
+		}
 	}()
 
-	// Connect client
-	clientConn, err := net.Dial("unix", clientSocket)
-	if err != nil {
-		t.Fatalf("Failed to connect client: %v", err)
-	}
-
-	// Connect to mock Docker
+	// Connect to mock docker
 	dockerConn, err := net.Dial("unix", dockerSocket)
 	if err != nil {
 		t.Fatalf("Failed to connect to mock Docker: %v", err)
 	}
 
+	// Create a pipe for the client side
+	clientReader, clientWriter := net.Pipe()
+
+	// Create connection handler
 	conn := &Connection{
 		logger:     logger,
-		clientConn: clientConn,
+		clientConn: clientReader,
 		dockerConn: dockerConn,
 	}
 
-	go conn.handleConnection(ctx)
+	// Start connection handler
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-	// Send test data
-	_, err = clientConn.Write(testData)
+	handlerDone := make(chan struct{})
+	go func() {
+		defer close(handlerDone)
+		conn.handleConnection(ctx)
+	}()
+
+	// Write test data
+	testData := []byte("test message")
+	_, err = clientWriter.Write(testData)
 	if err != nil {
 		t.Fatalf("Failed to write test data: %v", err)
 	}
 
-	// Read response
-	buf := make([]byte, len(testData))
-	n, err := clientConn.Read(buf)
-	if err != nil {
-		t.Fatalf("Failed to read response: %v", err)
+	// Wait for message to be received
+	select {
+	case <-messageReceived:
+		// Message was received by mock server
+	case <-time.After(time.Second):
+		t.Fatal("Timeout waiting for message to be received")
 	}
 
-	if string(buf[:n]) != string(testData) {
-		t.Errorf("Expected %s, got %s", testData, buf[:n])
+	// Clean shutdown
+	clientWriter.Close()
+
+	// Wait for handler to finish
+	select {
+	case <-handlerDone:
+		// Handler completed
+	case <-time.After(time.Second):
+		t.Fatal("Timeout waiting for handler to complete")
+	}
+
+	// Wait for server to finish
+	select {
+	case <-serverDone:
+		// Server completed
+	case <-time.After(time.Second):
+		t.Fatal("Timeout waiting for server to complete")
 	}
 }
 
@@ -142,8 +158,9 @@ func TestIntegration(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
+	uid := os.Getuid()
+	userSocket := filepath.Join(tempDir, fmt.Sprintf("user_%d.sock", uid))
 	systemSocket := filepath.Join(tempDir, "docker.sock")
-	userSocket := filepath.Join(tempDir, "user.sock")
 
 	// Start mock user Docker daemon
 	userListener, err := net.Listen("unix", userSocket)
@@ -152,65 +169,123 @@ func TestIntegration(t *testing.T) {
 	}
 	defer userListener.Close()
 
-	// Set up echo server for mock Docker daemon
-	go func() {
-		for {
-			conn, err := userListener.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				buf := make([]byte, 1024)
-				n, err := c.Read(buf)
-				if err != nil {
-					return
-				}
-				c.Write(buf[:n])
-			}(conn)
-		}
-	}()
+	// Channel to track server readiness
+	serverReady := make(chan struct{})
+	serverDone := make(chan struct{})
 
-	// Override socket paths for testing
-	os.Setenv("SYSTEM_SOCKET", systemSocket)
-	os.Setenv("USER_SOCKET_FORMAT", userSocket)
-
-	// Start router in background
+	// Create context for the test
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Echo server
 	go func() {
-		main()
+		defer close(serverDone)
+		close(serverReady) // Signal server is ready to accept
+		for {
+			conn, err := userListener.Accept()
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return // Normal shutdown
+				default:
+					t.Errorf("Accept error: %v", err)
+					continue
+				}
+			}
+			go echo(conn)
+		}
 	}()
 
-	// Wait for router to start
-	time.Sleep(time.Second)
+	// Wait for echo server to be ready
+	<-serverReady
 
-	// Test connection
+	// Create test configuration with socket format
+	config := SocketConfig{
+		SystemSocket:         systemSocket,
+		RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"), // Format string for user socket
+	}
+
+	mainErr := make(chan error, 1)
+	logger := zaptest.NewLogger(t)
+
+	go func() {
+		mainErr <- startRouter(ctx, config, logger)
+	}()
+
+	// Wait for system socket to be available
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(systemSocket); err == nil {
+			time.Sleep(50 * time.Millisecond)
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Connect and send data
 	conn, err := net.Dial("unix", systemSocket)
 	if err != nil {
 		t.Fatalf("Failed to connect to router: %v", err)
 	}
 	defer conn.Close()
 
-	testMsg := []byte("test message")
-	_, err = conn.Write(testMsg)
+	// Write test data
+	testData := []byte("test message")
+	_, err = conn.Write(testData)
 	if err != nil {
-		t.Fatalf("Failed to write test message: %v", err)
+		t.Fatalf("Failed to write: %v", err)
 	}
 
-	buf := make([]byte, len(testMsg))
-	n, err := conn.Read(buf)
-	if err != nil {
-		t.Fatalf("Failed to read response: %v", err)
+	// Read response
+	buf := make([]byte, len(testData))
+	readChan := make(chan []byte)
+	readErrChan := make(chan error)
+
+	go func() {
+		n, err := conn.Read(buf)
+		if err != nil {
+			readErrChan <- err
+			return
+		}
+		readChan <- buf[:n]
+	}()
+
+	// Wait for response
+	select {
+	case data := <-readChan:
+		if string(data) != string(testData) {
+			t.Errorf("Expected %q, got %q", testData, data)
+		}
+	case err := <-readErrChan:
+		t.Fatalf("Failed to read: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for response")
 	}
 
-	if string(buf[:n]) != string(testMsg) {
-		t.Errorf("Expected %s, got %s", testMsg, buf[:n])
+	// Clean shutdown
+	cancel()
+
+	select {
+	case err := <-mainErr:
+		if err != nil {
+			t.Fatalf("main exited with error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for clean shutdown")
 	}
 }
 
-func TestGetUserUid(t *testing.T) {
+func echo(conn net.Conn) {
+	defer conn.Close()
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return
+	}
+	conn.Write(buf[:n])
+}
+
+func TestGetUserId(t *testing.T) {
 	tempDir := t.TempDir()
 	socketPath := filepath.Join(tempDir, "test.sock")
 
@@ -220,7 +295,9 @@ func TestGetUserUid(t *testing.T) {
 	}
 	defer listener.Close()
 
+	acceptDone := make(chan struct{})
 	go func() {
+		defer close(acceptDone)
 		conn, err := listener.Accept()
 		if err != nil {
 			t.Errorf("Accept error: %v", err)
@@ -243,4 +320,6 @@ func TestGetUserUid(t *testing.T) {
 	if uid != uint32(os.Getuid()) {
 		t.Errorf("Expected UID %d, got %d", os.Getuid(), uid)
 	}
+
+	<-acceptDone
 }
