@@ -15,17 +15,23 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.21'
+          go-version: '1.23'
           check-latest: true
 
       - name: Install dependencies
         run: go mod download
 
-      - name: Run unit tests
+      - name: Run quick tests
+        run: go test -v -short ./...
+
+      - name: Run full test suite with coverage
         run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
 
-      - name: Run integration tests
-        run: go test -v -tags=integration ./...
+      - name: Upload coverage
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: coverage.txt
 
   lint:
     runs-on: ubuntu-latest
