@@ -2,12 +2,11 @@ package router
 
 import (
 	"context"
+	"go.uber.org/zap"
 	"io"
 	"net"
 	"testing"
 	"time"
-
-	"go.uber.org/zap/zaptest"
 )
 
 type mockConn struct {
@@ -37,53 +36,55 @@ func (m *mockConn) Close() error {
 }
 
 func TestConnection(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	clientData := []byte("client message")
-	dockerData := []byte("docker response")
+	withTestLogger(t, func(logger *zap.Logger) {
+		clientData := []byte("client message")
+		dockerData := []byte("docker response")
 
-	clientConn := &mockConn{readData: clientData}
-	dockerConn := &mockConn{readData: dockerData}
+		clientConn := &mockConn{readData: clientData}
+		dockerConn := &mockConn{readData: dockerData}
 
-	conn := NewConnection(logger, clientConn, dockerConn)
+		conn := NewConnection(logger, clientConn, dockerConn)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
 
-	conn.Handle(ctx)
+		conn.Handle(ctx)
 
-	if !clientConn.closed {
-		t.Error("client connection not closed")
-	}
-	if !dockerConn.closed {
-		t.Error("docker connection not closed")
-	}
+		if !clientConn.closed {
+			t.Error("client connection not closed")
+		}
+		if !dockerConn.closed {
+			t.Error("docker connection not closed")
+		}
 
-	if string(dockerConn.writeData) != string(clientData) {
-		t.Errorf("expected docker to receive %q, got %q", clientData, dockerConn.writeData)
-	}
+		if string(dockerConn.writeData) != string(clientData) {
+			t.Errorf("expected docker to receive %q, got %q", clientData, dockerConn.writeData)
+		}
+	})
 }
 
 func TestConnectionContextCancellation(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	clientConn := &mockConn{readData: make([]byte, 1024)}
-	dockerConn := &mockConn{readData: make([]byte, 1024)}
+	withTestLogger(t, func(logger *zap.Logger) {
+		clientConn := &mockConn{readData: make([]byte, 1024)}
+		dockerConn := &mockConn{readData: make([]byte, 1024)}
 
-	conn := NewConnection(logger, clientConn, dockerConn)
+		conn := NewConnection(logger, clientConn, dockerConn)
 
-	ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(context.Background())
 
-	// Cancel the context after a short delay
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
+		// Cancel the context after a short delay
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
 
-	conn.Handle(ctx)
+		conn.Handle(ctx)
 
-	if !clientConn.closed {
-		t.Error("client connection should be closed after context cancellation")
-	}
-	if !dockerConn.closed {
-		t.Error("docker connection should be closed after context cancellation")
-	}
+		if !clientConn.closed {
+			t.Error("client connection should be closed after context cancellation")
+		}
+		if !dockerConn.closed {
+			t.Error("docker connection should be closed after context cancellation")
+		}
+	})
 }

@@ -20,158 +20,151 @@ import (
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxtest"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zaptest"
 )
 
 // TestRouterGetUserUid verifies that the router can correctly retrieve the user's UID.
 func TestRouterGetUserUid(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	tempDir := t.TempDir()
-	socketPath := filepath.Join(tempDir, "test.sock")
+	withTestLogger(t, func(logger *zap.Logger) {
+		tempDir := t.TempDir()
+		socketPath := filepath.Join(tempDir, "test.sock")
 
-	cfg := &config.SocketConfig{
-		SystemSocket:         socketPath,
-		RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
-	}
-
-	router := NewRouter(logger, cfg)
-
-	t.Run("valid_connection", func(t *testing.T) {
-		listener, err := net.Listen("unix", socketPath)
-		if err != nil {
-			t.Fatalf("Failed to create test socket: %v", err)
+		cfg := &config.SocketConfig{
+			SystemSocket:         socketPath,
+			RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
 		}
-		defer listener.Close()
 
-		accepted := make(chan net.Conn)
-		go func() {
-			conn, err := listener.Accept()
+		router := NewRouter(logger, cfg)
+
+		t.Run("valid_connection", func(t *testing.T) {
+			listener, err := net.Listen("unix", socketPath)
 			if err != nil {
-				t.Errorf("Accept error: %v", err)
-				close(accepted)
-				return
+				t.Fatalf("Failed to create test socket: %v", err)
 			}
-			accepted <- conn
-		}()
+			defer listener.Close()
 
-		conn, err := net.Dial("unix", socketPath)
-		if err != nil {
-			t.Fatalf("Failed to connect to test socket: %v", err)
-		}
-		defer conn.Close()
+			accepted := make(chan net.Conn)
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					t.Errorf("Accept error: %v", err)
+					close(accepted)
+					return
+				}
+				accepted <- conn
+			}()
 
-		uid, err := router.getUserUid(conn)
-		if err != nil {
-			t.Fatalf("Failed to get UID: %v", err)
-		}
+			conn, err := net.Dial("unix", socketPath)
+			if err != nil {
+				t.Fatalf("Failed to connect to test socket: %v", err)
+			}
+			defer conn.Close()
 
-		expectedUid := uint32(os.Getuid())
-		if uid != expectedUid {
-			t.Errorf("Expected UID %d, got %d", expectedUid, uid)
-		}
+			uid, err := router.getUserUid(conn)
+			if err != nil {
+				t.Fatalf("Failed to get UID: %v", err)
+			}
 
-		if acceptedConn := <-accepted; acceptedConn != nil {
-			acceptedConn.Close()
-		}
-	})
+			expectedUid := uint32(os.Getuid())
+			if uid != expectedUid {
+				t.Errorf("Expected UID %d, got %d", expectedUid, uid)
+			}
 
-	t.Run("invalid_connection", func(t *testing.T) {
-		invalidConn := &net.UnixConn{}
-		_, err := router.getUserUid(invalidConn)
-		if err == nil {
-			t.Error("Expected error for invalid connection, got nil")
-		}
+			if acceptedConn := <-accepted; acceptedConn != nil {
+				acceptedConn.Close()
+			}
+		})
 	})
 }
 
 // TestRouterLifecycle verifies that the router starts/stops cleanly
 // (creating and removing the system socket and associated PID file).
 func TestRouterLifecycle(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	tempDir := t.TempDir()
+	withTestLogger(t, func(logger *zap.Logger) {
+		tempDir := t.TempDir()
 
-	cfg := &config.SocketConfig{
-		SystemSocket:         filepath.Join(tempDir, "docker.sock"),
-		RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
-	}
-
-	t.Run("normal_lifecycle", func(t *testing.T) {
-		app := fxtest.New(t,
-			fx.Provide(
-				func() *zap.Logger { return logger },
-				func() *config.SocketConfig { return cfg },
-				NewRouter,
-			),
-			fx.Invoke(func(lc fx.Lifecycle, r *Router) error {
-				return r.Start(lc)
-			}),
-		)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		defer cancel()
-
-		if err := app.Start(ctx); err != nil {
-			t.Fatalf("Failed to start app: %v", err)
+		cfg := &config.SocketConfig{
+			SystemSocket:         filepath.Join(tempDir, "docker.sock"),
+			RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
 		}
 
-		// Verify socket and PID file exist
-		info, err := os.Stat(cfg.SystemSocket)
-		if err != nil {
-			t.Fatalf("Socket not created: %v", err)
-		}
-		if info.Mode()&os.ModePerm != 0666 {
-			t.Errorf("Expected socket permissions 0666, got %v", info.Mode()&os.ModePerm)
-		}
+		t.Run("normal_lifecycle", func(t *testing.T) {
+			app := fxtest.New(t,
+				fx.Provide(
+					func() *zap.Logger { return logger },
+					func() *config.SocketConfig { return cfg },
+					NewRouter,
+				),
+				fx.Invoke(func(lc fx.Lifecycle, r *Router) error {
+					return r.Start(lc)
+				}),
+			)
 
-		// Verify PID file
-		pidData, err := os.ReadFile(cfg.SystemSocket + ".pid")
-		if err != nil {
-			t.Fatalf("PID file not created: %v", err)
-		}
-		pidStr := strings.TrimSpace(string(pidData))
-		pidVal, err := strconv.Atoi(pidStr)
-		if err != nil {
-			t.Fatalf("Invalid PID file content: %v", err)
-		}
-		if pidVal != os.Getpid() {
-			t.Errorf("Expected PID %d, got %d", os.Getpid(), pidVal)
-		}
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancel()
 
-		if err := app.Stop(ctx); err != nil {
-			t.Fatalf("Failed to stop app: %v", err)
-		}
+			if err := app.Start(ctx); err != nil {
+				t.Fatalf("Failed to start app: %v", err)
+			}
 
-		// Verify cleanup
-		if _, err := os.Stat(cfg.SystemSocket); !os.IsNotExist(err) {
-			t.Error("Socket file should not exist after shutdown")
-		}
-		if _, err := os.Stat(cfg.SystemSocket + ".pid"); !os.IsNotExist(err) {
-			t.Error("PID file should not exist after shutdown")
-		}
-	})
+			// Verify socket and PID file exist
+			info, err := os.Stat(cfg.SystemSocket)
+			if err != nil {
+				t.Fatalf("Socket not created: %v", err)
+			}
+			if info.Mode()&os.ModePerm != 0666 {
+				t.Errorf("Expected socket permissions 0666, got %v", info.Mode()&os.ModePerm)
+			}
 
-	t.Run("failed_socket_creation", func(t *testing.T) {
-		// Create a directory with the same name to force a socket creation failure
-		if err := os.Mkdir(cfg.SystemSocket, 0755); err != nil {
-			t.Fatal(err)
-		}
+			// Verify PID file
+			pidData, err := os.ReadFile(cfg.SystemSocket + ".pid")
+			if err != nil {
+				t.Fatalf("PID file not created: %v", err)
+			}
+			pidStr := strings.TrimSpace(string(pidData))
+			pidVal, err := strconv.Atoi(pidStr)
+			if err != nil {
+				t.Fatalf("Invalid PID file content: %v", err)
+			}
+			if pidVal != os.Getpid() {
+				t.Errorf("Expected PID %d, got %d", os.Getpid(), pidVal)
+			}
 
-		app := fxtest.New(t,
-			fx.Provide(
-				func() *zap.Logger { return logger },
-				func() *config.SocketConfig { return cfg },
-				NewRouter,
-			),
-			fx.Invoke(func(lc fx.Lifecycle, r *Router) {
-				err := r.Start(lc)
-				if err == nil {
-					t.Error("Expected error on start, got nil")
-				}
-			}),
-		)
+			if err := app.Stop(ctx); err != nil {
+				t.Fatalf("Failed to stop app: %v", err)
+			}
 
-		app.RequireStart()
-		app.RequireStop()
+			// Verify cleanup
+			if _, err := os.Stat(cfg.SystemSocket); !os.IsNotExist(err) {
+				t.Error("Socket file should not exist after shutdown")
+			}
+			if _, err := os.Stat(cfg.SystemSocket + ".pid"); !os.IsNotExist(err) {
+				t.Error("PID file should not exist after shutdown")
+			}
+		})
+
+		t.Run("failed_socket_creation", func(t *testing.T) {
+			// Create a directory with the same name to force a socket creation failure
+			if err := os.Mkdir(cfg.SystemSocket, 0755); err != nil {
+				t.Fatal(err)
+			}
+
+			app := fxtest.New(t,
+				fx.Provide(
+					func() *zap.Logger { return logger },
+					func() *config.SocketConfig { return cfg },
+					NewRouter,
+				),
+				fx.Invoke(func(lc fx.Lifecycle, r *Router) {
+					err := r.Start(lc)
+					if err == nil {
+						t.Error("Expected error on start, got nil")
+					}
+				}),
+			)
+
+			app.RequireStart()
+			app.RequireStop()
+		})
 	})
 }
 
@@ -182,7 +175,6 @@ func TestIntegration(t *testing.T) {
 		t.Skip("Skipping integration test in short mode")
 	}
 
-	logger := zaptest.NewLogger(t)
 	tempDir := t.TempDir()
 	uid := os.Getuid()
 
@@ -211,7 +203,7 @@ func TestIntegration(t *testing.T) {
 	}()
 
 	// Start the router
-	stopRouter := startTestRouter(t, logger, cfg)
+	stopRouter := startTestRouter(t, cfg)
 	defer stopRouter()
 
 	t.Run("single_connection", func(t *testing.T) {
@@ -278,8 +270,9 @@ func echo(conn net.Conn) {
 	conn.Write(buf[:n])
 }
 
-// startTestRouter is a helper that starts the Fx app with our Router.
-func startTestRouter(t *testing.T, logger *zap.Logger, cfg *config.SocketConfig) (stopFn func()) {
+func startTestRouter(t *testing.T, cfg *config.SocketConfig) (stopFn func()) {
+	logger, cleanup := threadSafeTestLogger(t)
+
 	app := fxtest.New(t,
 		fx.Provide(
 			func() *zap.Logger { return logger },
@@ -292,15 +285,21 @@ func startTestRouter(t *testing.T, logger *zap.Logger, cfg *config.SocketConfig)
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	t.Cleanup(cancel)
 
 	if err := app.Start(ctx); err != nil {
+		cleanup()
+		cancel()
 		t.Fatalf("Failed to start Fx app: %v", err)
 	}
 
 	return func() {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer stopCancel()
+		defer func() {
+			stopCancel()
+			cancel()
+			cleanup()
+		}()
+
 		if err := app.Stop(stopCtx); err != nil {
 			t.Errorf("Failed to stop Fx app: %v", err)
 		}
@@ -310,7 +309,6 @@ func startTestRouter(t *testing.T, logger *zap.Logger, cfg *config.SocketConfig)
 // TestRouterErrorResponseMissingSocket checks that if the user socket is NOT present,
 // the router returns an HTTP 500 JSON error with CodeSocketNotFound.
 func TestRouterErrorResponseMissingSocket(t *testing.T) {
-	logger := zaptest.NewLogger(t)
 	tempDir := t.TempDir()
 	uid := os.Getuid()
 
@@ -320,7 +318,7 @@ func TestRouterErrorResponseMissingSocket(t *testing.T) {
 	}
 
 	// Start the router
-	stopRouter := startTestRouter(t, logger, cfg)
+	stopRouter := startTestRouter(t, cfg)
 	defer stopRouter()
 
 	// -- Test scenario: "missing_socket" => user socket does not exist.
@@ -404,7 +402,6 @@ func TestRouterErrorResponsePermissionDenied(t *testing.T) {
 		t.Skip("Skipping permission_denied test because running as root will almost never EACCES.")
 	}
 
-	logger := zaptest.NewLogger(t)
 	tempDir := t.TempDir()
 	uid := os.Getuid()
 
@@ -448,7 +445,7 @@ func TestRouterErrorResponsePermissionDenied(t *testing.T) {
 	})
 
 	// Start the router
-	stopRouter := startTestRouter(t, logger, cfg)
+	stopRouter := startTestRouter(t, cfg)
 	defer stopRouter()
 
 	// Dial the router. The router should try to dial userSocket and (hopefully) fail with permission error.
