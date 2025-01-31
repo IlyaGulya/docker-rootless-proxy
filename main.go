@@ -6,6 +6,7 @@ import (
 	"docker-socket-router/version"
 	"flag"
 	"fmt"
+	"go.uber.org/fx/fxevent"
 
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -13,6 +14,7 @@ import (
 
 func main() {
 	versionFlag := flag.Bool("version", false, "Print version information and exit")
+	verbose := flag.Bool("verbose", false, "Enable verbose logging")
 	flag.Parse()
 
 	if *versionFlag {
@@ -26,6 +28,15 @@ func main() {
 			zap.NewProduction,
 			router.NewRouter,
 		),
+		fx.WithLogger(func(logger *zap.Logger) fxevent.Logger {
+			if *verbose {
+				return &fxevent.ZapLogger{
+					Logger: logger,
+				}
+			} else {
+				return fxevent.NopLogger
+			}
+		}),
 		fx.Invoke(func(lc fx.Lifecycle, router *router.Router) error {
 			return router.Start(lc)
 		}),
