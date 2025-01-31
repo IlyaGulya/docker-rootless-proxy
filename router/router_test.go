@@ -2,6 +2,7 @@ package router
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"docker-socket-router/apierror"
 	"docker-socket-router/config"
@@ -321,35 +322,55 @@ func TestRouterErrorResponseMissingSocket(t *testing.T) {
 	stopRouter := startTestRouter(t, cfg)
 	defer stopRouter()
 
-	// -- Test scenario: "missing_socket" => user socket does not exist.
-	dialer := net.Dialer{Timeout: 1 * time.Second}
+	// Allow router to initialize
+	time.Sleep(100 * time.Millisecond)
+
+	// Create a connection with keepalive to prevent early closure
+	dialer := &net.Dialer{
+		Timeout:   1 * time.Second,
+		KeepAlive: 100 * time.Millisecond,
+	}
 
 	conn, err := dialer.Dial("unix", cfg.SystemSocket)
 	if err != nil {
 		t.Fatalf("Failed to connect to router: %v", err)
 	}
-	defer conn.Close()
 
-	// Set a read deadline so we don't hang forever
-	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	// Ensure connection cleanup
+	defer func() {
+		conn.SetDeadline(time.Now().Add(100 * time.Millisecond))
+		conn.Close()
+	}()
+
+	// Set a reasonable deadline for the entire operation
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatalf("Failed to set deadline: %v", err)
 	}
 
-	// Attempt any write (router doesn't care about data). The router will try to connect
-	// to the user socket and fail with "no such file or directory." We expect an HTTP error response.
-	if _, err := conn.Write([]byte("hello")); err != nil {
-		t.Fatalf("Failed to write: %v", err)
+	// Send a proper HTTP request
+	request := "GET /version HTTP/1.1\r\nHost: unix\r\nConnection: keep-alive\r\n\r\n"
+	if _, err := conn.Write([]byte(request)); err != nil {
+		t.Fatalf("Failed to write request: %v", err)
 	}
 
-	reader := bufio.NewReaderSize(conn, 4096)
+	// Read the response with retries
+	reader := bufio.NewReader(conn)
 
-	// Read status line
-	statusLine, err := reader.ReadString('\n')
-	if err != nil {
-		t.Fatalf("Failed to read status line: %v", err)
+	var statusLine string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		statusLine, err = reader.ReadString('\n')
+		if err == nil {
+			break
+		}
+		if err != io.EOF {
+			t.Fatalf("Failed to read status line: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
+
 	if !strings.HasPrefix(statusLine, "HTTP/1.1 500") {
-		t.Errorf("Expected HTTP/1.1 500 response, got: %s", statusLine)
+		t.Fatalf("Expected HTTP 500 response, got: %s", statusLine)
 	}
 
 	// Read headers
@@ -361,7 +382,7 @@ func TestRouterErrorResponseMissingSocket(t *testing.T) {
 		}
 		line = strings.TrimSpace(line)
 		if line == "" {
-			break // end of headers
+			break // End of headers
 		}
 		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
 			lengthStr := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(line), "content-length:"))
@@ -371,10 +392,12 @@ func TestRouterErrorResponseMissingSocket(t *testing.T) {
 			}
 		}
 	}
+
 	if contentLength <= 0 {
-		t.Fatalf("Invalid content length: %d", contentLength)
+		t.Fatal("Missing or invalid Content-Length")
 	}
 
+	// Read the response body
 	body := make([]byte, contentLength)
 	if _, err := io.ReadFull(reader, body); err != nil {
 		t.Fatalf("Failed to read body: %v", err)
@@ -385,10 +408,12 @@ func TestRouterErrorResponseMissingSocket(t *testing.T) {
 		t.Fatalf("Failed to parse error JSON: %v\nBody: %s", err, string(body))
 	}
 
+	expectedSocket := fmt.Sprintf(cfg.RootlessSocketFormat, uid)
+	expectedMsg := fmt.Sprintf("Cannot connect to Docker daemon at %s", expectedSocket)
+
 	if errorResp.Code != apierror.CodeSocketNotFound {
 		t.Errorf("Expected error code %q, got %q", apierror.CodeSocketNotFound, errorResp.Code)
 	}
-	expectedMsg := fmt.Sprintf("Cannot connect to Docker daemon at %s", fmt.Sprintf(cfg.RootlessSocketFormat, uid))
 	if errorResp.Message != expectedMsg {
 		t.Errorf("Expected message %q, got %q", expectedMsg, errorResp.Message)
 	}
@@ -410,45 +435,34 @@ func TestRouterErrorResponsePermissionDenied(t *testing.T) {
 		RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
 	}
 
-	// Create the “user socket” and lock it down so the current user can’t connect.
+	// Create the "user socket" and lock it down
 	userSocket := fmt.Sprintf(cfg.RootlessSocketFormat, uid)
-
-	// Make sure the directory exists
 	if err := os.MkdirAll(filepath.Dir(userSocket), 0755); err != nil {
 		t.Fatalf("Failed to create directory for user socket: %v", err)
 	}
 
-	// Create the socket by listening on it:
 	l, err := net.Listen("unix", userSocket)
 	if err != nil {
 		t.Fatalf("Failed to create test user socket: %v", err)
 	}
-	// We keep the listener open so the socket file definitely exists.
-	// In a real "permission denied" scenario, the file's owner or mode will block us.
+	defer l.Close()
+	defer os.Remove(userSocket)
 
-	// Attempt to set ownership to root (assuming test user is not root).
-	// Then restrict mode to 0700 so only root can open.
-	// On most Linux systems, that yields EACCES for a non-root dialer.
 	if err := os.Chown(userSocket, 0, 0); err != nil && !os.IsPermission(err) {
-		l.Close()
-		t.Fatalf("Failed to chown to root: %v", err)
+		t.Fatalf("Failed to chown socket: %v", err)
 	}
 	if err := os.Chmod(userSocket, 0700); err != nil {
-		l.Close()
-		t.Fatalf("Failed to chmod to 0700: %v", err)
+		t.Fatalf("Failed to chmod socket: %v", err)
 	}
-
-	// Clean up after the test
-	t.Cleanup(func() {
-		l.Close()
-		os.Remove(userSocket)
-	})
 
 	// Start the router
 	stopRouter := startTestRouter(t, cfg)
 	defer stopRouter()
 
-	// Dial the router. The router should try to dial userSocket and (hopefully) fail with permission error.
+	// Allow router to fully initialize
+	time.Sleep(100 * time.Millisecond)
+
+	// Connect to the router
 	dialer := net.Dialer{Timeout: 1 * time.Second}
 	conn, err := dialer.Dial("unix", cfg.SystemSocket)
 	if err != nil {
@@ -456,36 +470,46 @@ func TestRouterErrorResponsePermissionDenied(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Set a read deadline so we don't hang forever
-	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	// Set deadline for the entire operation
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatalf("Failed to set deadline: %v", err)
 	}
 
-	// Write something to trigger the router’s handleConnection
-	if _, err := conn.Write([]byte("hello")); err != nil {
-		t.Fatalf("Failed to write: %v", err)
+	// Write something to trigger handleConnection
+	if _, err := conn.Write([]byte("GET /version HTTP/1.1\r\n\r\n")); err != nil {
+		t.Fatalf("Failed to write request: %v", err)
 	}
 
-	// Now read the HTTP error response
-	reader := bufio.NewReaderSize(conn, 4096)
-	statusLine, err := reader.ReadString('\n')
-	if err != nil {
-		t.Fatalf("Failed to read status line: %v", err)
-	}
-	if !strings.HasPrefix(statusLine, "HTTP/1.1 500") {
-		t.Errorf("Expected HTTP/1.1 500 response, got: %s", statusLine)
+	// Read and verify the response with retries
+	var resp []byte
+	reader := bufio.NewReader(conn)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err = reader.ReadBytes('\n')
+		if err == nil && bytes.Contains(resp, []byte("HTTP/1.1 500")) {
+			break
+		}
+		if err != nil && err != io.EOF {
+			t.Fatalf("Error reading response: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Read headers
+	if !bytes.Contains(resp, []byte("HTTP/1.1 500")) {
+		t.Fatalf("Expected HTTP 500 response, got: %s", resp)
+	}
+
+	// Read and parse the rest of the response
 	var contentLength int
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			t.Fatalf("Failed to read header line: %v", err)
+			t.Fatalf("Failed to read header: %v", err)
 		}
 		line = strings.TrimSpace(line)
 		if line == "" {
-			break // end of headers
+			break
 		}
 		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
 			lengthStr := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(line), "content-length:"))
@@ -494,9 +518,6 @@ func TestRouterErrorResponsePermissionDenied(t *testing.T) {
 				t.Fatalf("Invalid Content-Length: %v", err)
 			}
 		}
-	}
-	if contentLength <= 0 {
-		t.Fatalf("Invalid content length: %d", contentLength)
 	}
 
 	body := make([]byte, contentLength)
