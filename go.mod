@@ -1,4 +1,4 @@
-module docker-rootless-proxy
+module docker-socket-router
 
 go 1.23
 
