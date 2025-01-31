@@ -1,2 +1,4 @@
 .idea
 prompt.txt
+# Added by goreleaser init:
+dist/
