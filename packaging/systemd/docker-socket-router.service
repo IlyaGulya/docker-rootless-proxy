@@ -1,0 +1,12 @@
+[Unit]
+Description=Docker Socket Router
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/docker-socket-router
+Restart=always
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
