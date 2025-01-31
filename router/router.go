@@ -2,10 +2,12 @@ package router
 
 import (
 	"context"
+	"docker-socket-router/apierror"
 	"docker-socket-router/config"
 	"fmt"
 	"net"
 	"os"
+	"time"
 
 	"go.uber.org/fx"
 	"go.uber.org/multierr"
@@ -56,10 +58,7 @@ func (r *Router) getUserUid(conn net.Conn) (uint32, error) {
 func (r *Router) Start(lc fx.Lifecycle) error {
 	socketMgr := newSocketManager(r.config.SystemSocket)
 
-	// Use multierr for error aggregation
-	var startErr error
-
-	// Try to acquire socket
+	// Acquire the system socket
 	acquired, err := socketMgr.acquireSocket()
 	if err != nil {
 		return fmt.Errorf("failed to acquire socket: %w", err)
@@ -68,7 +67,7 @@ func (r *Router) Start(lc fx.Lifecycle) error {
 		return fmt.Errorf("socket %s is in use by another process", r.config.SystemSocket)
 	}
 
-	// Create new socket
+	// Create the Unix domain socket listener
 	listener, err := net.Listen("unix", r.config.SystemSocket)
 	if err != nil {
 		releaseErr := socketMgr.releaseSocket()
@@ -78,15 +77,13 @@ func (r *Router) Start(lc fx.Lifecycle) error {
 		)
 	}
 
-	// Set permissions
+	// Set socket permissions to allow all users to connect
 	if err := os.Chmod(r.config.SystemSocket, 0666); err != nil {
-		startErr = multierr.Combine(
-			startErr,
+		return multierr.Combine(
 			fmt.Errorf("failed to set socket permissions: %w", err),
 			listener.Close(),
 			socketMgr.releaseSocket(),
 		)
-		return startErr
 	}
 
 	r.logger.Info("listening", zap.String("socket", r.config.SystemSocket))
@@ -131,27 +128,83 @@ func (r *Router) acceptConnections(listener net.Listener) {
 }
 
 func (r *Router) handleConnection(clientConn net.Conn) {
+	defer clientConn.Close()
+
 	uid, err := r.getUserUid(clientConn)
 	if err != nil {
 		r.logger.Error("failed to get user credentials", zap.Error(err))
-		clientConn.Close()
+		// Write an HTTP 500 JSON error, then return
+		if writeErr := r.writeErrorResponse(
+			clientConn,
+			"Permission denied while accessing Docker daemon",
+			apierror.CodePermissionDenied,
+		); writeErr != nil {
+			r.logger.Error("failed to write error response", zap.Error(writeErr))
+		}
 		return
 	}
 
 	userSocket := fmt.Sprintf(r.config.RootlessSocketFormat, uid)
 	r.logger.Info("new connection",
 		zap.Uint32("uid", uid),
-		zap.String("user_socket", userSocket))
+		zap.String("user_socket", userSocket),
+	)
 
-	dockerConn, err := net.Dial("unix", userSocket)
+	dialer := net.Dialer{Timeout: 250 * time.Millisecond}
+	dockerConn, err := dialer.Dial("unix", userSocket)
 	if err != nil {
 		r.logger.Error("failed to connect to user socket",
 			zap.String("socket", userSocket),
-			zap.Error(err))
-		clientConn.Close()
+			zap.Error(err),
+		)
+
+		var sysErr error
+		if opErr, ok := err.(*net.OpError); ok {
+			sysErr = opErr.Err
+		} else {
+			sysErr = err
+		}
+
+		var response string
+		var code string
+		switch {
+		case os.IsNotExist(sysErr):
+			response = fmt.Sprintf("Cannot connect to Docker daemon at %s", userSocket)
+			code = apierror.CodeSocketNotFound
+
+		case os.IsPermission(sysErr):
+			response = "Permission denied while trying to connect to Docker daemon"
+			code = apierror.CodePermissionDenied
+
+		default:
+			response = fmt.Sprintf("Error while connecting to Docker daemon: %v", err)
+			code = apierror.CodeConnectionFailed
+		}
+
+		if writeErr := r.writeErrorResponse(clientConn, response, code); writeErr != nil {
+			r.logger.Error("failed to write error response", zap.Error(writeErr))
+		}
 		return
 	}
 
 	conn := NewConnection(r.logger, clientConn, dockerConn)
 	conn.Handle(context.Background())
+}
+
+func (r *Router) writeErrorResponse(conn net.Conn, message, code string) error {
+	// Set a very short deadline for writing the error
+	if err := conn.SetWriteDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+		return fmt.Errorf("failed to set write deadline: %w", err)
+	}
+
+	if err := apierror.WriteError(conn, message, code); err != nil {
+		return fmt.Errorf("failed to write error: %w", err)
+	}
+
+	// Try to flush/close the connection cleanly
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetLinger(0) // Don't wait on close
+	}
+
+	return nil
 }
