@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"docker-socket-router/version"
+	"flag"
 	"fmt"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
@@ -176,6 +178,14 @@ func startRouter(ctx context.Context, config SocketConfig, logger *zap.Logger) e
 }
 
 func main() {
+	versionFlag := flag.Bool("version", false, "Print version information and exit")
+	flag.Parse()
+
+	if *versionFlag {
+		fmt.Println(version.Info())
+		return
+	}
+
 	logger, err := zap.NewProduction()
 	if err != nil {
 		panic(fmt.Sprintf("failed to initialize logger: %v", err))
@@ -198,6 +208,8 @@ func main() {
 		logger.Info("received shutdown signal")
 		cancel()
 	}()
+
+	logger.Info("starting docker-socket-router", zap.String("version", version.Version()))
 
 	if err := startRouter(ctx, defaultConfig, logger); err != nil {
 		os.Exit(1)
