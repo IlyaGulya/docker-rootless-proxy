@@ -8,7 +8,9 @@ import (
 	"os"
 
 	"go.uber.org/fx"
+	"go.uber.org/multierr"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 )
 
@@ -54,10 +56,13 @@ func (r *Router) getUserUid(conn net.Conn) (uint32, error) {
 func (r *Router) Start(lc fx.Lifecycle) error {
 	socketMgr := newSocketManager(r.config.SystemSocket)
 
+	// Use multierr for error aggregation
+	var startErr error
+
 	// Try to acquire socket
 	acquired, err := socketMgr.acquireSocket()
 	if err != nil {
-		return fmt.Errorf("failed to acquire socket: %v", err)
+		return fmt.Errorf("failed to acquire socket: %w", err)
 	}
 	if !acquired {
 		return fmt.Errorf("socket %s is in use by another process", r.config.SystemSocket)
@@ -66,29 +71,44 @@ func (r *Router) Start(lc fx.Lifecycle) error {
 	// Create new socket
 	listener, err := net.Listen("unix", r.config.SystemSocket)
 	if err != nil {
-		socketMgr.releaseSocket() // Cleanup on failure
-		return fmt.Errorf("failed to create listener: %v", err)
+		releaseErr := socketMgr.releaseSocket()
+		return multierr.Combine(
+			fmt.Errorf("failed to create listener: %w", err),
+			releaseErr,
+		)
 	}
 
 	// Set permissions
 	if err := os.Chmod(r.config.SystemSocket, 0666); err != nil {
-		listener.Close()
-		socketMgr.releaseSocket()
-		return fmt.Errorf("failed to set socket permissions: %v", err)
+		startErr = multierr.Combine(
+			startErr,
+			fmt.Errorf("failed to set socket permissions: %w", err),
+			listener.Close(),
+			socketMgr.releaseSocket(),
+		)
+		return startErr
 	}
 
 	r.logger.Info("listening", zap.String("socket", r.config.SystemSocket))
 
+	// Using fx lifecycle hooks with errgroup for concurrent shutdown
 	lc.Append(fx.Hook{
 		OnStart: func(context.Context) error {
 			go r.acceptConnections(listener)
 			return nil
 		},
 		OnStop: func(ctx context.Context) error {
-			if err := listener.Close(); err != nil {
-				r.logger.Error("failed to close listener", zap.Error(err))
-			}
-			return socketMgr.releaseSocket()
+			g := errgroup.Group{}
+
+			g.Go(func() error {
+				return listener.Close()
+			})
+
+			g.Go(func() error {
+				return socketMgr.releaseSocket()
+			})
+
+			return g.Wait()
 		},
 	})
 
