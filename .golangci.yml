@@ -1,0 +1,54 @@
+linters:
+  enable:
+    - gofmt
+    - govet
+    - errcheck
+    - staticcheck
+    - gosimple
+    - ineffassign
+    - typecheck
+    - unused
+    - goconst
+    - gosec
+    - prealloc
+    - unconvert
+    - unparam
+    - gocyclo
+    - misspell
+
+linters-settings:
+  gocyclo:
+    min-complexity: 15
+  maligned:
+    suggest-new: true
+  goconst:
+    min-len: 2
+    min-occurrences: 3
+  misspell:
+    locale: US
+  gosec:
+    excludes:
+      - G204 # Audit use of command execution (we need this for system commands)
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gosec # Security checks in tests are often false positives
+        - errcheck # Error checking in tests is often unnecessary
+
+  exclude-dirs:
+    - vendor
+    - third_party
+
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+run:
+  timeout: 5m
+  tests: false
+
+output:
+  formats:
+    - format: colored-line-number
+  sort-results: true

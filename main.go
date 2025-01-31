@@ -33,13 +33,19 @@ func NewLogger() (*Logger, error) {
 
 func (l *Logger) Info(format string, v ...interface{}) {
 	msg := fmt.Sprintf(format, v...)
-	l.syslog.Info(msg)
+	if err := l.syslog.Info(msg); err != nil {
+		// If syslog fails, ensure we at least have the message in standard log
+		log.Printf("ERROR: Failed to write to syslog: %v", err)
+	}
 	log.Printf("INFO: %s", msg)
 }
 
 func (l *Logger) Error(format string, v ...interface{}) {
 	msg := fmt.Sprintf(format, v...)
-	l.syslog.Err(msg)
+	if err := l.syslog.Err(msg); err != nil {
+		// If syslog fails, ensure we at least have the message in standard log
+		log.Printf("ERROR: Failed to write to syslog: %v", err)
+	}
 	log.Printf("ERROR: %s", msg)
 }
 

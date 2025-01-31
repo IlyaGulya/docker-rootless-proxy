@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+          check-latest: true
+
+      - name: Run tests
+        run: go test -v ./...
+
+  goreleaser:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+          check-latest: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v4
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-binaries:
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Get version
+        id: get_version
+        # language=bash
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+      - name: Build binary
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        # language=bash
+        run: |
+          go build -v -o docker-socket-router-linux-${{ matrix.arch }}
+          tar czf docker-socket-router-${{ env.VERSION }}-linux-${{ matrix.arch }}.tar.gz docker-socket-router-linux-${{ matrix.arch }}
+
+      - name: Upload binary to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: docker-socket-router-${{ env.VERSION }}-linux-${{ matrix.arch }}.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-latest:
+    needs: [build-binaries, goreleaser]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update latest release
+        uses: actions/github-script@v7
+        with:
+          # language=js
+          script: |
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            
+            const latestRelease = releases[0];
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: latestRelease.id,
+              make_latest: true
+            });
