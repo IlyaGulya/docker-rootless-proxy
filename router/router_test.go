@@ -7,6 +7,7 @@ import (
 	"docker-socket-router/config"
 	"encoding/json"
 	"fmt"
+	"go.uber.org/fx"
 	"io"
 	"net"
 	"os"
@@ -124,22 +125,34 @@ func TestRouterLifecycle(t *testing.T) {
 	})
 
 	t.Run("failed_socket_creation", func(t *testing.T) {
-		// Create a directory with the same name as the socket to force a creation failure.
+		// Create a directory with the same name as the socket.
 		if err := os.Mkdir(cfg.SystemSocket, 0755); err != nil {
 			t.Fatal(err)
 		}
 
-		// Use our TestAppBuilder. Since the socket path is already taken by a directory,
-		// the router start should fail.
-		builder := NewTestAppBuilder(t, cfg)
-		app := builder.Build()
+		// Build the Fx app directly (without fxtest.New) so we can capture the error.
+		app := fx.New(
+			fx.Provide(
+				func() *zap.Logger { return zap.NewExample() },
+				func() *config.SocketConfig { return cfg },
+				func() Dialer { return NewDefaultDialer() },
+				func(logger *zap.Logger, cfg *config.SocketConfig, dialer Dialer) *Router {
+					return NewRouter(logger, cfg, dialer)
+				},
+			),
+			fx.Invoke(func(lc fx.Lifecycle, r *Router) error {
+				return r.Start(lc)
+			}),
+		)
+
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 		err := app.Start(ctx)
 		if err == nil {
 			t.Error("Expected error on start due to socket creation failure, got nil")
 		}
-		app.RequireStop()
+		// Stop the app even though startup failed.
+		_ = app.Stop(ctx)
 	})
 }
 
