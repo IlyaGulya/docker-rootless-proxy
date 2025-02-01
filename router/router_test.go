@@ -17,8 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"go.uber.org/fx"
-	"go.uber.org/fx/fxtest"
 	"go.uber.org/zap"
 )
 
@@ -79,94 +77,69 @@ func TestRouterGetUserUid(t *testing.T) {
 // TestRouterLifecycle verifies that the router starts/stops cleanly
 // (creating and removing the system socket and associated PID file).
 func TestRouterLifecycle(t *testing.T) {
-	withTestLogger(t, func(logger *zap.Logger) {
-		tempDir := t.TempDir()
+	tempDir := t.TempDir()
 
-		cfg := &config.SocketConfig{
-			SystemSocket:         filepath.Join(tempDir, "docker.sock"),
-			RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
+	cfg := &config.SocketConfig{
+		SystemSocket:         filepath.Join(tempDir, "docker.sock"),
+		RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
+	}
+
+	t.Run("normal_lifecycle", func(t *testing.T) {
+		// Use our TestAppBuilder helper.
+		builder := NewTestAppBuilder(t, cfg)
+		stopRouter := builder.Start(context.Background())
+		// Verify that the socket file exists with the proper permissions.
+		info, err := os.Stat(cfg.SystemSocket)
+		if err != nil {
+			t.Fatalf("Socket not created: %v", err)
+		}
+		if info.Mode()&os.ModePerm != 0666 {
+			t.Errorf("Expected socket permissions 0666, got %v", info.Mode()&os.ModePerm)
 		}
 
-		t.Run("normal_lifecycle", func(t *testing.T) {
-			app := fxtest.New(t,
-				fx.Provide(
-					func() *zap.Logger { return logger },
-					func() *config.SocketConfig { return cfg },
-					NewRouter,
-					NewDefaultDialer,
-				),
-				fx.Invoke(func(lc fx.Lifecycle, r *Router) error {
-					return r.Start(lc)
-				}),
-			)
+		// Verify that the PID file exists and contains our PID.
+		pidData, err := os.ReadFile(cfg.SystemSocket + ".pid")
+		if err != nil {
+			t.Fatalf("PID file not created: %v", err)
+		}
+		pidStr := strings.TrimSpace(string(pidData))
+		pidVal, err := strconv.Atoi(pidStr)
+		if err != nil {
+			t.Fatalf("Invalid PID file content: %v", err)
+		}
+		if pidVal != os.Getpid() {
+			t.Errorf("Expected PID %d, got %d", os.Getpid(), pidVal)
+		}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-			defer cancel()
+		// Shut down the router.
+		stopRouter()
 
-			if err := app.Start(ctx); err != nil {
-				t.Fatalf("Failed to start app: %v", err)
-			}
+		// Verify that the socket and PID file have been removed.
+		if _, err := os.Stat(cfg.SystemSocket); !os.IsNotExist(err) {
+			t.Error("Socket file should not exist after shutdown")
+		}
+		if _, err := os.Stat(cfg.SystemSocket + ".pid"); !os.IsNotExist(err) {
+			t.Error("PID file should not exist after shutdown")
+		}
+	})
 
-			// Verify socket and PID file exist
-			info, err := os.Stat(cfg.SystemSocket)
-			if err != nil {
-				t.Fatalf("Socket not created: %v", err)
-			}
-			if info.Mode()&os.ModePerm != 0666 {
-				t.Errorf("Expected socket permissions 0666, got %v", info.Mode()&os.ModePerm)
-			}
+	t.Run("failed_socket_creation", func(t *testing.T) {
+		// Create a directory with the same name as the socket to force a creation failure.
+		if err := os.Mkdir(cfg.SystemSocket, 0755); err != nil {
+			t.Fatal(err)
+		}
 
-			// Verify PID file
-			pidData, err := os.ReadFile(cfg.SystemSocket + ".pid")
-			if err != nil {
-				t.Fatalf("PID file not created: %v", err)
-			}
-			pidStr := strings.TrimSpace(string(pidData))
-			pidVal, err := strconv.Atoi(pidStr)
-			if err != nil {
-				t.Fatalf("Invalid PID file content: %v", err)
-			}
-			if pidVal != os.Getpid() {
-				t.Errorf("Expected PID %d, got %d", os.Getpid(), pidVal)
-			}
-
-			if err := app.Stop(ctx); err != nil {
-				t.Fatalf("Failed to stop app: %v", err)
-			}
-
-			// Verify cleanup
-			if _, err := os.Stat(cfg.SystemSocket); !os.IsNotExist(err) {
-				t.Error("Socket file should not exist after shutdown")
-			}
-			if _, err := os.Stat(cfg.SystemSocket + ".pid"); !os.IsNotExist(err) {
-				t.Error("PID file should not exist after shutdown")
-			}
-		})
-
-		t.Run("failed_socket_creation", func(t *testing.T) {
-			// Create a directory with the same name to force a socket creation failure
-			if err := os.Mkdir(cfg.SystemSocket, 0755); err != nil {
-				t.Fatal(err)
-			}
-
-			app := fxtest.New(t,
-				fx.Provide(
-					func() *zap.Logger { return logger },
-					func() *config.SocketConfig { return cfg },
-					NewRouter,
-					NewDefaultDialer,
-				),
-				fx.Invoke(func(lc fx.Lifecycle, r *Router) {
-					err := r.Start(lc)
-					if err == nil {
-						t.Error("Expected error on start, got nil")
-					}
-				}),
-			)
-
-			app.RequireStart()
-			app.RequireStop()
-		})
+		// Use our TestAppBuilder. Since the socket path is already taken by a directory,
+		// the router start should fail.
+		builder := NewTestAppBuilder(t, cfg)
+		app := builder.Build()
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		err := app.Start(ctx)
+		if err == nil {
+			t.Error("Expected error on start due to socket creation failure, got nil")
+		}
+		app.RequireStop()
 	})
 }
 
@@ -185,7 +158,7 @@ func TestIntegration(t *testing.T) {
 		RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
 	}
 
-	// Create a mock Docker user socket
+	// Create a mock Docker user socket.
 	userSocket := fmt.Sprintf(cfg.RootlessSocketFormat, uid)
 	userListener, err := net.Listen("unix", userSocket)
 	if err != nil {
@@ -193,7 +166,7 @@ func TestIntegration(t *testing.T) {
 	}
 	defer userListener.Close()
 
-	// Basic echo server
+	// Basic echo server.
 	go func() {
 		for {
 			conn, err := userListener.Accept()
@@ -204,8 +177,9 @@ func TestIntegration(t *testing.T) {
 		}
 	}()
 
-	// Start the router
-	stopRouter := startTestRouter(t, cfg)
+	// Start the router using our TestAppBuilder.
+	builder := NewTestAppBuilder(t, cfg)
+	stopRouter := builder.Start(context.Background())
 	defer stopRouter()
 
 	t.Run("single_connection", func(t *testing.T) {
@@ -272,50 +246,6 @@ func echo(conn net.Conn) {
 	conn.Write(buf[:n])
 }
 
-// startTestRouter is a convenience wrapper for startTestRouterWithDialer using the default dialer.
-func startTestRouter(t *testing.T, cfg *config.SocketConfig) (stopFn func()) {
-	return startTestRouterWithDialer(t, cfg, NewDefaultDialer())
-}
-
-func startTestRouterWithDialer(t *testing.T, cfg *config.SocketConfig, dialer Dialer) (stopFn func()) {
-	logger, cleanup := threadSafeTestLogger(t)
-
-	app := fxtest.New(t,
-		fx.Provide(
-			func() *zap.Logger { return logger },
-			func() *config.SocketConfig { return cfg },
-			// Provide the dialer (could be a mock)
-			func() Dialer { return dialer },
-			// NewRouter now accepts logger, config, and dialer.
-			func(logger *zap.Logger, cfg *config.SocketConfig, dialer Dialer) *Router {
-				return NewRouter(logger, cfg, dialer)
-			},
-		),
-		fx.Invoke(func(lc fx.Lifecycle, r *Router) error {
-			return r.Start(lc)
-		}),
-	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	if err := app.Start(ctx); err != nil {
-		cleanup()
-		cancel()
-		t.Fatalf("Failed to start Fx app: %v", err)
-	}
-
-	return func() {
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer func() {
-			stopCancel()
-			cancel()
-			cleanup()
-		}()
-		if err := app.Stop(stopCtx); err != nil {
-			t.Errorf("Failed to stop Fx app: %v", err)
-		}
-	}
-}
-
 // TestRouterErrorResponseMissingSocket checks that if the user socket is NOT present,
 // the router returns an HTTP 500 JSON error with CodeSocketNotFound.
 func TestRouterErrorResponseMissingSocket(t *testing.T) {
@@ -327,14 +257,15 @@ func TestRouterErrorResponseMissingSocket(t *testing.T) {
 		RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
 	}
 
-	// Start the router
-	stopRouter := startTestRouter(t, cfg)
+	// Start the router.
+	builder := NewTestAppBuilder(t, cfg)
+	stopRouter := builder.Start(context.Background())
 	defer stopRouter()
 
-	// Allow router to initialize
+	// Allow router to initialize.
 	time.Sleep(100 * time.Millisecond)
 
-	// Create a connection with keepalive to prevent early closure
+	// Create a connection with keepalive to prevent early closure.
 	dialer := &net.Dialer{
 		Timeout:   1 * time.Second,
 		KeepAlive: 100 * time.Millisecond,
@@ -344,25 +275,24 @@ func TestRouterErrorResponseMissingSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to connect to router: %v", err)
 	}
-
-	// Ensure connection cleanup
+	// Ensure connection cleanup.
 	defer func() {
 		conn.SetDeadline(time.Now().Add(100 * time.Millisecond))
 		conn.Close()
 	}()
 
-	// Set a reasonable deadline for the entire operation
+	// Set a reasonable deadline for the entire operation.
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatalf("Failed to set deadline: %v", err)
 	}
 
-	// Send a proper HTTP request
+	// Send a proper HTTP request.
 	request := "GET /version HTTP/1.1\r\nHost: unix\r\nConnection: keep-alive\r\n\r\n"
 	if _, err := conn.Write([]byte(request)); err != nil {
 		t.Fatalf("Failed to write request: %v", err)
 	}
 
-	// Read the response with retries
+	// Read the response with retries.
 	reader := bufio.NewReader(conn)
 
 	var statusLine string
@@ -382,7 +312,7 @@ func TestRouterErrorResponseMissingSocket(t *testing.T) {
 		t.Fatalf("Expected HTTP 500 response, got: %s", statusLine)
 	}
 
-	// Read headers
+	// Read headers.
 	var contentLength int
 	for {
 		line, err := reader.ReadString('\n')
@@ -391,7 +321,7 @@ func TestRouterErrorResponseMissingSocket(t *testing.T) {
 		}
 		line = strings.TrimSpace(line)
 		if line == "" {
-			break // End of headers
+			break // End of headers.
 		}
 		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
 			lengthStr := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(line), "content-length:"))
@@ -406,7 +336,7 @@ func TestRouterErrorResponseMissingSocket(t *testing.T) {
 		t.Fatal("Missing or invalid Content-Length")
 	}
 
-	// Read the response body
+	// Read the response body.
 	body := make([]byte, contentLength)
 	if _, err := io.ReadFull(reader, body); err != nil {
 		t.Fatalf("Failed to read body: %v", err)
@@ -426,15 +356,6 @@ func TestRouterErrorResponseMissingSocket(t *testing.T) {
 	if errorResp.Message != expectedMsg {
 		t.Errorf("Expected message %q, got %q", expectedMsg, errorResp.Message)
 	}
-}
-
-// mockDialer implements the Dialer interface. It returns the configured error.
-type mockDialer struct {
-	err error
-}
-
-func (m *mockDialer) Dial(network, address string) (net.Conn, error) {
-	return nil, m.err
 }
 
 // TestRouterErrorResponsePermissionDenied checks that if the router tries to connect
@@ -458,13 +379,14 @@ func TestRouterErrorResponsePermissionDenied(t *testing.T) {
 
 	// We do not need to actually create a user socket file because our mock dialer
 	// simulates the dial error.
-	stopRouter := startTestRouterWithDialer(t, cfg, mock)
+	builder := NewTestAppBuilder(t, cfg).WithDialer(mock)
+	stopRouter := builder.Start(context.Background())
 	defer stopRouter()
 
-	// Allow router to fully initialize
+	// Allow router to fully initialize.
 	time.Sleep(100 * time.Millisecond)
 
-	// Connect to the router
+	// Connect to the router.
 	dialer := net.Dialer{Timeout: 1 * time.Second}
 	conn, err := dialer.Dial("unix", cfg.SystemSocket)
 	if err != nil {
@@ -472,12 +394,12 @@ func TestRouterErrorResponsePermissionDenied(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Set deadline for the entire operation
+	// Set deadline for the entire operation.
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatalf("Failed to set deadline: %v", err)
 	}
 
-	// Write something to trigger handleConnection
+	// Write something to trigger handleConnection.
 	if _, err := conn.Write([]byte("GET /version HTTP/1.1\r\n\r\n")); err != nil {
 		t.Fatalf("Failed to write request: %v", err)
 	}
@@ -535,4 +457,13 @@ func TestRouterErrorResponsePermissionDenied(t *testing.T) {
 	if errorResp.Message != expectedMsg {
 		t.Errorf("Expected message %q, got %q", expectedMsg, errorResp.Message)
 	}
+}
+
+// mockDialer implements the Dialer interface. It returns the configured error.
+type mockDialer struct {
+	err error
+}
+
+func (m *mockDialer) Dial(network, address string) (net.Conn, error) {
+	return nil, m.err
 }
