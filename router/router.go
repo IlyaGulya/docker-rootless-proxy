@@ -19,12 +19,15 @@ import (
 type Router struct {
 	logger *zap.Logger
 	config *config.SocketConfig
+	dialer Dialer
 }
 
-func NewRouter(logger *zap.Logger, config *config.SocketConfig) *Router {
+// NewRouter now requires a Dialer (in addition to logger and config).
+func NewRouter(logger *zap.Logger, config *config.SocketConfig, dialer Dialer) *Router {
 	return &Router{
 		logger: logger,
 		config: config,
+		dialer: dialer,
 	}
 }
 
@@ -150,8 +153,8 @@ func (r *Router) handleConnection(clientConn net.Conn) {
 		zap.String("user_socket", userSocket),
 	)
 
-	dialer := net.Dialer{Timeout: 250 * time.Millisecond}
-	dockerConn, err := dialer.Dial("unix", userSocket)
+	// Instead of creating a net.Dialer here, use the injected dialer.
+	dockerConn, err := r.dialer.Dial("unix", userSocket)
 	if err != nil {
 		r.logger.Error("failed to connect to user socket",
 			zap.String("socket", userSocket),

@@ -2,7 +2,6 @@ package router
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"docker-socket-router/apierror"
 	"docker-socket-router/config"
@@ -34,7 +33,7 @@ func TestRouterGetUserUid(t *testing.T) {
 			RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
 		}
 
-		router := NewRouter(logger, cfg)
+		router := NewRouter(logger, cfg, NewDefaultDialer())
 
 		t.Run("valid_connection", func(t *testing.T) {
 			listener, err := net.Listen("unix", socketPath)
@@ -94,6 +93,7 @@ func TestRouterLifecycle(t *testing.T) {
 					func() *zap.Logger { return logger },
 					func() *config.SocketConfig { return cfg },
 					NewRouter,
+					NewDefaultDialer,
 				),
 				fx.Invoke(func(lc fx.Lifecycle, r *Router) error {
 					return r.Start(lc)
@@ -154,6 +154,7 @@ func TestRouterLifecycle(t *testing.T) {
 					func() *zap.Logger { return logger },
 					func() *config.SocketConfig { return cfg },
 					NewRouter,
+					NewDefaultDialer,
 				),
 				fx.Invoke(func(lc fx.Lifecycle, r *Router) {
 					err := r.Start(lc)
@@ -271,14 +272,24 @@ func echo(conn net.Conn) {
 	conn.Write(buf[:n])
 }
 
+// startTestRouter is a convenience wrapper for startTestRouterWithDialer using the default dialer.
 func startTestRouter(t *testing.T, cfg *config.SocketConfig) (stopFn func()) {
+	return startTestRouterWithDialer(t, cfg, NewDefaultDialer())
+}
+
+func startTestRouterWithDialer(t *testing.T, cfg *config.SocketConfig, dialer Dialer) (stopFn func()) {
 	logger, cleanup := threadSafeTestLogger(t)
 
 	app := fxtest.New(t,
 		fx.Provide(
 			func() *zap.Logger { return logger },
 			func() *config.SocketConfig { return cfg },
-			NewRouter,
+			// Provide the dialer (could be a mock)
+			func() Dialer { return dialer },
+			// NewRouter now accepts logger, config, and dialer.
+			func(logger *zap.Logger, cfg *config.SocketConfig, dialer Dialer) *Router {
+				return NewRouter(logger, cfg, dialer)
+			},
 		),
 		fx.Invoke(func(lc fx.Lifecycle, r *Router) error {
 			return r.Start(lc)
@@ -286,7 +297,6 @@ func startTestRouter(t *testing.T, cfg *config.SocketConfig) (stopFn func()) {
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-
 	if err := app.Start(ctx); err != nil {
 		cleanup()
 		cancel()
@@ -300,7 +310,6 @@ func startTestRouter(t *testing.T, cfg *config.SocketConfig) (stopFn func()) {
 			cancel()
 			cleanup()
 		}()
-
 		if err := app.Stop(stopCtx); err != nil {
 			t.Errorf("Failed to stop Fx app: %v", err)
 		}
@@ -419,44 +428,37 @@ func TestRouterErrorResponseMissingSocket(t *testing.T) {
 	}
 }
 
+// mockDialer implements the Dialer interface. It returns the configured error.
+type mockDialer struct {
+	err error
+}
+
+func (m *mockDialer) Dial(network, address string) (net.Conn, error) {
+	return nil, m.err
+}
+
 // TestRouterErrorResponsePermissionDenied checks that if the router tries to connect
-// to a user socket but lacks permissions, we get a 500 JSON error with CodePermissionDenied.
-// Many systems return EACCES. If running as root, skip this test because root can usually connect.
+// to a user socket but lacks permissions, we get an HTTP 500 JSON error with CodePermissionDenied.
 func TestRouterErrorResponsePermissionDenied(t *testing.T) {
+	// Skip if running as root because root can usually connect.
 	if os.Geteuid() == 0 {
 		t.Skip("Skipping permission_denied test because running as root will almost never EACCES.")
 	}
 
+	// Create a mock dialer that always returns a permission error.
+	permErr := os.ErrPermission
+	mock := &mockDialer{err: permErr}
+
 	tempDir := t.TempDir()
-	uid := os.Getuid()
 
 	cfg := &config.SocketConfig{
 		SystemSocket:         filepath.Join(tempDir, "docker.sock"),
 		RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
 	}
 
-	// Create the "user socket" and lock it down
-	userSocket := fmt.Sprintf(cfg.RootlessSocketFormat, uid)
-	if err := os.MkdirAll(filepath.Dir(userSocket), 0755); err != nil {
-		t.Fatalf("Failed to create directory for user socket: %v", err)
-	}
-
-	l, err := net.Listen("unix", userSocket)
-	if err != nil {
-		t.Fatalf("Failed to create test user socket: %v", err)
-	}
-	defer l.Close()
-	defer os.Remove(userSocket)
-
-	if err := os.Chown(userSocket, 0, 0); err != nil && !os.IsPermission(err) {
-		t.Fatalf("Failed to chown socket: %v", err)
-	}
-	if err := os.Chmod(userSocket, 0700); err != nil {
-		t.Fatalf("Failed to chmod socket: %v", err)
-	}
-
-	// Start the router
-	stopRouter := startTestRouter(t, cfg)
+	// We do not need to actually create a user socket file because our mock dialer
+	// simulates the dial error.
+	stopRouter := startTestRouterWithDialer(t, cfg, mock)
 	defer stopRouter()
 
 	// Allow router to fully initialize
@@ -480,36 +482,27 @@ func TestRouterErrorResponsePermissionDenied(t *testing.T) {
 		t.Fatalf("Failed to write request: %v", err)
 	}
 
-	// Read and verify the response with retries
-	var resp []byte
+	// Read and verify the HTTP error response.
 	reader := bufio.NewReader(conn)
-
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err = reader.ReadBytes('\n')
-		if err == nil && bytes.Contains(resp, []byte("HTTP/1.1 500")) {
-			break
-		}
-		if err != nil && err != io.EOF {
-			t.Fatalf("Error reading response: %v", err)
-		}
-		time.Sleep(100 * time.Millisecond)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read status line: %v", err)
 	}
 
-	if !bytes.Contains(resp, []byte("HTTP/1.1 500")) {
-		t.Fatalf("Expected HTTP 500 response, got: %s", resp)
+	if !strings.HasPrefix(statusLine, "HTTP/1.1 500") {
+		t.Fatalf("Expected HTTP 1.1 500 response, got: %s", statusLine)
 	}
 
-	// Read and parse the rest of the response
+	// Read headers.
 	var contentLength int
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			t.Fatalf("Failed to read header: %v", err)
+			t.Fatalf("Failed to read header line: %v", err)
 		}
 		line = strings.TrimSpace(line)
 		if line == "" {
-			break
+			break // End of headers.
 		}
 		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
 			lengthStr := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(line), "content-length:"))
@@ -520,6 +513,11 @@ func TestRouterErrorResponsePermissionDenied(t *testing.T) {
 		}
 	}
 
+	if contentLength <= 0 {
+		t.Fatal("Missing or invalid Content-Length")
+	}
+
+	// Read the response body.
 	body := make([]byte, contentLength)
 	if _, err := io.ReadFull(reader, body); err != nil {
 		t.Fatalf("Failed to read body: %v", err)

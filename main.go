@@ -26,6 +26,7 @@ func main() {
 		fx.Provide(
 			config.ProvideConfig,
 			zap.NewProduction,
+			router.NewDefaultDialer,
 			router.NewRouter,
 		),
 		fx.WithLogger(func(logger *zap.Logger) fxevent.Logger {
