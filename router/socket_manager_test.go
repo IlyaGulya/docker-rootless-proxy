@@ -124,7 +124,7 @@ func TestSocketManagerAcquisition(t *testing.T) {
 			}
 			defer tt.cleanup()
 
-			sm := newSocketManager(cfg.SystemSocket)
+			sm := NewSocketManager(cfg.SystemSocket)
 			acquired, err := sm.acquireSocket()
 
 			if (err != nil) != tt.wantErr {

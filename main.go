@@ -6,6 +6,7 @@ import (
 	"docker-socket-router/version"
 	"flag"
 	"fmt"
+
 	"go.uber.org/fx/fxevent"
 
 	"go.uber.org/fx"
@@ -28,6 +29,9 @@ func main() {
 			zap.NewProduction,
 			router.NewDefaultDialer,
 			router.NewRouter,
+			func(config *config.SocketConfig) *router.SocketManager {
+				return router.NewSocketManager(config.SystemSocket)
+			},
 		),
 		fx.WithLogger(func(logger *zap.Logger) fxevent.Logger {
 			if *verbose {

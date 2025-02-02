@@ -8,13 +8,13 @@ import (
 	"syscall"
 )
 
-type socketManager struct {
+type SocketManager struct {
 	socketPath string
 	pidFile    string
 }
 
-func newSocketManager(socketPath string) *socketManager {
-	return &socketManager{
+func NewSocketManager(socketPath string) *SocketManager {
+	return &SocketManager{
 		socketPath: socketPath,
 		pidFile:    socketPath + ".pid",
 	}
@@ -22,7 +22,7 @@ func newSocketManager(socketPath string) *socketManager {
 
 // acquireSocket attempts to create or take ownership of the socket
 // Returns true if successful, false if socket is owned by another process
-func (sm *socketManager) acquireSocket() (bool, error) {
+func (sm *SocketManager) acquireSocket() (bool, error) {
 	// 1) Does the pid file already exist?
 	pid, err := sm.readPIDFile()
 	switch {
@@ -77,7 +77,7 @@ func (sm *socketManager) acquireSocket() (bool, error) {
 }
 
 // releaseSocket removes the socket only if we still own it
-func (sm *socketManager) releaseSocket() error {
+func (sm *SocketManager) releaseSocket() error {
 	// Verify we own the socket by checking the PID file
 	pid, err := sm.readPIDFile()
 	if err != nil {
@@ -101,7 +101,7 @@ func (sm *socketManager) releaseSocket() error {
 }
 
 // readPIDFile reads & parses the pid file into an int, trimming spaces/newlines.
-func (sm *socketManager) readPIDFile() (int, error) {
+func (sm *SocketManager) readPIDFile() (int, error) {
 	data, err := os.ReadFile(sm.pidFile)
 	if err != nil {
 		return 0, err
@@ -111,7 +111,7 @@ func (sm *socketManager) readPIDFile() (int, error) {
 }
 
 // isProcessRunning returns true if a process with the given PID is still running.
-func (sm *socketManager) isProcessRunning(pid int) bool {
+func (sm *SocketManager) isProcessRunning(pid int) bool {
 	if pid <= 0 {
 		return false
 	}

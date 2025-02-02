@@ -21,11 +21,11 @@ type Router struct {
 	logger    *zap.Logger
 	config    *config.SocketConfig
 	dialer    Dialer
-	socketMgr *socketManager
+	socketMgr *SocketManager
 }
 
 // NewRouter creates a new Router instance.
-func NewRouter(logger *zap.Logger, cfg *config.SocketConfig, dialer Dialer, socketMgr *socketManager) *Router {
+func NewRouter(logger *zap.Logger, cfg *config.SocketConfig, dialer Dialer, socketMgr *SocketManager) *Router {
 	return &Router{
 		logger:    logger,
 		config:    cfg,
@@ -153,48 +153,7 @@ func (r *Router) handleConnection(clientConn net.Conn) {
 		zap.String("user_socket", userSocket),
 	)
 
-	// First check if the socket exists at all
-	_, err = os.Stat(userSocket)
-	if err != nil {
-		if os.IsNotExist(err) {
-			r.logger.Error("user socket not found",
-				zap.String("socket", userSocket),
-			)
-			if writeErr := r.writeErrorResponse(
-				clientConn,
-				fmt.Sprintf("Cannot connect to Docker daemon at %s", userSocket),
-				apierror.CodeSocketNotFound,
-			); writeErr != nil {
-				r.logger.Error("failed to write error response", zap.Error(writeErr))
-			}
-			return
-		}
-		if os.IsPermission(err) {
-			r.logger.Warn("user lacks permission to access their socket",
-				zap.Uint32("uid", uid),
-				zap.String("socket", userSocket),
-			)
-			if writeErr := r.writeErrorResponse(
-				clientConn,
-				"Permission denied while trying to connect to Docker daemon",
-				apierror.CodePermissionDenied,
-			); writeErr != nil {
-				r.logger.Error("failed to write error response", zap.Error(writeErr))
-			}
-			return
-		}
-		// For any other error, treat it as a permission issue
-		r.logger.Error("failed to check socket existence",
-			zap.String("socket", userSocket),
-			zap.Error(err),
-		)
-		if writeErr := r.writeErrorResponse(
-			clientConn,
-			"Permission denied while trying to connect to Docker daemon",
-			apierror.CodePermissionDenied,
-		); writeErr != nil {
-			r.logger.Error("failed to write error response", zap.Error(writeErr))
-		}
+	if !r.isSocketAvailable(clientConn, userSocket) {
 		return
 	}
 
@@ -264,6 +223,52 @@ func (r *Router) handleConnection(clientConn net.Conn) {
 
 	conn := NewConnection(r.logger, clientConn, dockerConn)
 	conn.Handle(context.Background())
+}
+
+func (r *Router) isSocketAvailable(clientConn net.Conn, userSocket string) bool {
+	_, err := os.Stat(userSocket)
+	if err != nil {
+		if os.IsNotExist(err) {
+			r.logger.Error("user socket not found",
+				zap.String("socket", userSocket),
+			)
+			if writeErr := r.writeErrorResponse(
+				clientConn,
+				fmt.Sprintf("Cannot connect to Docker daemon at %s", userSocket),
+				apierror.CodeSocketNotFound,
+			); writeErr != nil {
+				r.logger.Error("failed to write error response", zap.Error(writeErr))
+			}
+			return false
+		}
+		if os.IsPermission(err) {
+			r.logger.Warn("docker-socket-proxy lacks permission to access user socket",
+				zap.String("socket", userSocket),
+			)
+			if writeErr := r.writeErrorResponse(
+				clientConn,
+				"Permission denied while trying to connect to Docker daemon",
+				apierror.CodePermissionDenied,
+			); writeErr != nil {
+				r.logger.Error("failed to write error response", zap.Error(writeErr))
+			}
+			return false
+		}
+		// For any other error, treat it as a permission issue
+		r.logger.Error("failed to check socket existence",
+			zap.String("socket", userSocket),
+			zap.Error(err),
+		)
+		if writeErr := r.writeErrorResponse(
+			clientConn,
+			"Permission denied while trying to connect to Docker daemon",
+			apierror.CodePermissionDenied,
+		); writeErr != nil {
+			r.logger.Error("failed to write error response", zap.Error(writeErr))
+		}
+		return false
+	}
+	return true
 }
 
 func (r *Router) writeErrorResponse(conn net.Conn, message, code string) error {

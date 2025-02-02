@@ -14,10 +14,10 @@ import (
 	"go.uber.org/zap"
 )
 
-// testSocketManager is a more aggressive version of socketManager for testing.
+// testSocketManager is a more aggressive version of SocketManager for testing.
 // It will forcefully clean up sockets and pid files.
 type testSocketManager struct {
-	*socketManager
+	*SocketManager
 	mu       sync.Mutex
 	acquired bool
 }
@@ -28,7 +28,7 @@ func newTestSocketManager(socketPath string) *testSocketManager {
 	os.Remove(socketPath + ".pid")
 
 	return &testSocketManager{
-		socketManager: newSocketManager(socketPath),
+		SocketManager: NewSocketManager(socketPath),
 		acquired:      false,
 	}
 }
@@ -161,7 +161,7 @@ func (b *TestAppBuilder) Build() *fxtest.App {
 			func() Dialer { return b.dialer },
 			func(logger *zap.Logger, cfg *config.SocketConfig, dialer Dialer) *Router {
 				// Use the test socket manager for tests
-				socketMgr := newTestSocketManager(cfg.SystemSocket).socketManager
+				socketMgr := newTestSocketManager(cfg.SystemSocket).SocketManager
 				return NewRouter(logger, cfg, dialer, socketMgr)
 			},
 		),

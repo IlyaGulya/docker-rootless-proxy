@@ -34,7 +34,7 @@ func TestRouterGetUserUid(t *testing.T) {
 			RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
 		}
 
-		router := NewRouter(logger, cfg, NewDefaultDialer(), newSocketManager(socketPath))
+		router := NewRouter(logger, cfg, NewDefaultDialer(), NewSocketManager(socketPath))
 
 		t.Run("valid_connection", func(t *testing.T) {
 			listener, err := net.Listen("unix", socketPath)
@@ -149,7 +149,7 @@ func TestRouterLifecycle(t *testing.T) {
 				func() Dialer { return NewDefaultDialer() },
 				func(logger *zap.Logger, cfg *config.SocketConfig, dialer Dialer) *Router {
 					// Use regular socket manager here since we want to test the failure case
-					return NewRouter(logger, cfg, dialer, newSocketManager(cfg.SystemSocket))
+					return NewRouter(logger, cfg, dialer, NewSocketManager(cfg.SystemSocket))
 				},
 			),
 			fx.Invoke(func(lc fx.Lifecycle, r *Router) error {
@@ -522,7 +522,7 @@ func TestSystemSocketSecurity(t *testing.T) {
 				<-start
 
 				// Create a router with the shared socket manager
-				r := NewRouter(zap.NewExample(), cfg, NewDefaultDialer(), sharedSocketMgr.socketManager)
+				r := NewRouter(zap.NewExample(), cfg, NewDefaultDialer(), sharedSocketMgr.SocketManager)
 
 				// Create a new Fx app just for lifecycle management
 				app := fx.New(
