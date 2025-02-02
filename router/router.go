@@ -4,6 +4,7 @@ import (
 	"context"
 	"docker-socket-router/apierror"
 	"docker-socket-router/config"
+	"docker-socket-router/security"
 	"fmt"
 	"net"
 	"os"
@@ -17,17 +18,19 @@ import (
 )
 
 type Router struct {
-	logger *zap.Logger
-	config *config.SocketConfig
-	dialer Dialer
+	logger    *zap.Logger
+	config    *config.SocketConfig
+	dialer    Dialer
+	socketMgr *socketManager
 }
 
-// NewRouter now requires a Dialer (in addition to logger and config).
-func NewRouter(logger *zap.Logger, config *config.SocketConfig, dialer Dialer) *Router {
+// NewRouter creates a new Router instance.
+func NewRouter(logger *zap.Logger, cfg *config.SocketConfig, dialer Dialer, socketMgr *socketManager) *Router {
 	return &Router{
-		logger: logger,
-		config: config,
-		dialer: dialer,
+		logger:    logger,
+		config:    cfg,
+		dialer:    dialer,
+		socketMgr: socketMgr,
 	}
 }
 
@@ -59,10 +62,8 @@ func (r *Router) getUserUid(conn net.Conn) (uint32, error) {
 }
 
 func (r *Router) Start(lc fx.Lifecycle) error {
-	socketMgr := newSocketManager(r.config.SystemSocket)
-
 	// Acquire the system socket
-	acquired, err := socketMgr.acquireSocket()
+	acquired, err := r.socketMgr.acquireSocket()
 	if err != nil {
 		return fmt.Errorf("failed to acquire socket: %w", err)
 	}
@@ -73,7 +74,7 @@ func (r *Router) Start(lc fx.Lifecycle) error {
 	// Create the Unix domain socket listener
 	listener, err := net.Listen("unix", r.config.SystemSocket)
 	if err != nil {
-		releaseErr := socketMgr.releaseSocket()
+		releaseErr := r.socketMgr.releaseSocket()
 		return multierr.Combine(
 			fmt.Errorf("failed to create listener: %w", err),
 			releaseErr,
@@ -85,7 +86,7 @@ func (r *Router) Start(lc fx.Lifecycle) error {
 		return multierr.Combine(
 			fmt.Errorf("failed to set socket permissions: %w", err),
 			listener.Close(),
-			socketMgr.releaseSocket(),
+			r.socketMgr.releaseSocket(),
 		)
 	}
 
@@ -105,7 +106,7 @@ func (r *Router) Start(lc fx.Lifecycle) error {
 			})
 
 			g.Go(func() error {
-				return socketMgr.releaseSocket()
+				return r.socketMgr.releaseSocket()
 			})
 
 			return g.Wait()
@@ -136,7 +137,6 @@ func (r *Router) handleConnection(clientConn net.Conn) {
 	uid, err := r.getUserUid(clientConn)
 	if err != nil {
 		r.logger.Error("failed to get user credentials", zap.Error(err))
-		// Write an HTTP 500 JSON error, then return
 		if writeErr := r.writeErrorResponse(
 			clientConn,
 			"Permission denied while accessing Docker daemon",
@@ -153,7 +153,84 @@ func (r *Router) handleConnection(clientConn net.Conn) {
 		zap.String("user_socket", userSocket),
 	)
 
-	// Instead of creating a net.Dialer here, use the injected dialer.
+	// First check if the socket exists at all
+	_, err = os.Stat(userSocket)
+	if err != nil {
+		if os.IsNotExist(err) {
+			r.logger.Error("user socket not found",
+				zap.String("socket", userSocket),
+			)
+			if writeErr := r.writeErrorResponse(
+				clientConn,
+				fmt.Sprintf("Cannot connect to Docker daemon at %s", userSocket),
+				apierror.CodeSocketNotFound,
+			); writeErr != nil {
+				r.logger.Error("failed to write error response", zap.Error(writeErr))
+			}
+			return
+		}
+		if os.IsPermission(err) {
+			r.logger.Warn("user lacks permission to access their socket",
+				zap.Uint32("uid", uid),
+				zap.String("socket", userSocket),
+			)
+			if writeErr := r.writeErrorResponse(
+				clientConn,
+				"Permission denied while trying to connect to Docker daemon",
+				apierror.CodePermissionDenied,
+			); writeErr != nil {
+				r.logger.Error("failed to write error response", zap.Error(writeErr))
+			}
+			return
+		}
+		// For any other error, treat it as a permission issue
+		r.logger.Error("failed to check socket existence",
+			zap.String("socket", userSocket),
+			zap.Error(err),
+		)
+		if writeErr := r.writeErrorResponse(
+			clientConn,
+			"Permission denied while trying to connect to Docker daemon",
+			apierror.CodePermissionDenied,
+		); writeErr != nil {
+			r.logger.Error("failed to write error response", zap.Error(writeErr))
+		}
+		return
+	}
+
+	// Then check if the user has permission to access it
+	canAccess, err := security.CanAccessSocket(userSocket, uid)
+	if err != nil {
+		r.logger.Error("failed to check socket access",
+			zap.String("socket", userSocket),
+			zap.Error(err),
+		)
+		if writeErr := r.writeErrorResponse(
+			clientConn,
+			"Error checking socket permissions",
+			apierror.CodePermissionDenied,
+		); writeErr != nil {
+			r.logger.Error("failed to write error response", zap.Error(writeErr))
+		}
+		return
+	}
+
+	if !canAccess {
+		r.logger.Warn("user lacks permission to access their socket",
+			zap.Uint32("uid", uid),
+			zap.String("socket", userSocket),
+		)
+		if writeErr := r.writeErrorResponse(
+			clientConn,
+			"Permission denied while trying to connect to Docker daemon",
+			apierror.CodePermissionDenied,
+		); writeErr != nil {
+			r.logger.Error("failed to write error response", zap.Error(writeErr))
+		}
+		return
+	}
+
+	// Finally try to connect
 	dockerConn, err := r.dialer.Dial("unix", userSocket)
 	if err != nil {
 		r.logger.Error("failed to connect to user socket",
@@ -171,14 +248,9 @@ func (r *Router) handleConnection(clientConn net.Conn) {
 		var response string
 		var code string
 		switch {
-		case os.IsNotExist(sysErr):
-			response = fmt.Sprintf("Cannot connect to Docker daemon at %s", userSocket)
-			code = apierror.CodeSocketNotFound
-
 		case os.IsPermission(sysErr):
 			response = "Permission denied while trying to connect to Docker daemon"
 			code = apierror.CodePermissionDenied
-
 		default:
 			response = fmt.Sprintf("Error while connecting to Docker daemon: %v", err)
 			code = apierror.CodeConnectionFailed
@@ -195,8 +267,8 @@ func (r *Router) handleConnection(clientConn net.Conn) {
 }
 
 func (r *Router) writeErrorResponse(conn net.Conn, message, code string) error {
-	// Set a very short deadline for writing the error
-	if err := conn.SetWriteDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+	// Set a longer deadline for writing the error
+	if err := conn.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		return fmt.Errorf("failed to set write deadline: %w", err)
 	}
 
@@ -208,6 +280,12 @@ func (r *Router) writeErrorResponse(conn net.Conn, message, code string) error {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.SetLinger(0) // Don't wait on close
 	}
+
+	// Add a small delay to ensure the client has time to read the response
+	time.Sleep(50 * time.Millisecond)
+
+	// Close the connection explicitly since we're done with it
+	_ = conn.Close()
 
 	return nil
 }

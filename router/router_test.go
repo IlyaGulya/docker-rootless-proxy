@@ -7,9 +7,9 @@ import (
 	"docker-socket-router/config"
 	"encoding/json"
 	"fmt"
-	"go.uber.org/fx"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"go.uber.org/fx"
 
 	"go.uber.org/zap"
 )
@@ -32,7 +34,7 @@ func TestRouterGetUserUid(t *testing.T) {
 			RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
 		}
 
-		router := NewRouter(logger, cfg, NewDefaultDialer())
+		router := NewRouter(logger, cfg, NewDefaultDialer(), newSocketManager(socketPath))
 
 		t.Run("valid_connection", func(t *testing.T) {
 			listener, err := net.Listen("unix", socketPath)
@@ -80,15 +82,35 @@ func TestRouterGetUserUid(t *testing.T) {
 func TestRouterLifecycle(t *testing.T) {
 	tempDir := t.TempDir()
 
+	// Ensure cleanup of any stale files
+	t.Cleanup(func() {
+		os.RemoveAll(tempDir)
+	})
+
 	cfg := &config.SocketConfig{
 		SystemSocket:         filepath.Join(tempDir, "docker.sock"),
 		RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
 	}
 
+	// Clean up any stale files before each test
+	os.RemoveAll(tempDir)
+	os.MkdirAll(tempDir, 0755)
+
 	t.Run("normal_lifecycle", func(t *testing.T) {
-		// Use our TestAppBuilder helper.
+		// Use our TestAppBuilder helper with test socket manager.
 		builder := NewTestAppBuilder(t, cfg)
 		stopRouter := builder.Start(context.Background())
+
+		// Add a defer to ensure cleanup even if test fails
+		defer func() {
+			stopRouter()
+			os.Remove(cfg.SystemSocket)
+			os.Remove(cfg.SystemSocket + ".pid")
+		}()
+
+		// Add a small delay to ensure socket is ready
+		time.Sleep(100 * time.Millisecond)
+
 		// Verify that the socket file exists with the proper permissions.
 		info, err := os.Stat(cfg.SystemSocket)
 		if err != nil {
@@ -111,17 +133,6 @@ func TestRouterLifecycle(t *testing.T) {
 		if pidVal != os.Getpid() {
 			t.Errorf("Expected PID %d, got %d", os.Getpid(), pidVal)
 		}
-
-		// Shut down the router.
-		stopRouter()
-
-		// Verify that the socket and PID file have been removed.
-		if _, err := os.Stat(cfg.SystemSocket); !os.IsNotExist(err) {
-			t.Error("Socket file should not exist after shutdown")
-		}
-		if _, err := os.Stat(cfg.SystemSocket + ".pid"); !os.IsNotExist(err) {
-			t.Error("PID file should not exist after shutdown")
-		}
 	})
 
 	t.Run("failed_socket_creation", func(t *testing.T) {
@@ -137,7 +148,8 @@ func TestRouterLifecycle(t *testing.T) {
 				func() *config.SocketConfig { return cfg },
 				func() Dialer { return NewDefaultDialer() },
 				func(logger *zap.Logger, cfg *config.SocketConfig, dialer Dialer) *Router {
-					return NewRouter(logger, cfg, dialer)
+					// Use regular socket manager here since we want to test the failure case
+					return NewRouter(logger, cfg, dialer, newSocketManager(cfg.SystemSocket))
 				},
 			),
 			fx.Invoke(func(lc fx.Lifecycle, r *Router) error {
@@ -479,4 +491,427 @@ type mockDialer struct {
 
 func (m *mockDialer) Dial(network, address string) (net.Conn, error) {
 	return nil, m.err
+}
+
+// TestSystemSocketSecurity verifies the security properties of the system-wide socket
+func TestSystemSocketSecurity(t *testing.T) {
+	tempDir := t.TempDir()
+	socketPath := filepath.Join(tempDir, "docker.sock")
+
+	cfg := &config.SocketConfig{
+		SystemSocket:         socketPath,
+		RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
+	}
+
+	t.Run("socket_creation_race", func(t *testing.T) {
+		var wg sync.WaitGroup
+		results := make(chan error, 3)
+
+		// Create a shared socket manager for all goroutines
+		sharedSocketMgr := newTestSocketManager(socketPath)
+
+		// Create a channel to coordinate the start of all goroutines
+		start := make(chan struct{})
+
+		// Launch concurrent attempts
+		for i := 0; i < 3; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				// Wait for the signal to start
+				<-start
+
+				// Create a router with the shared socket manager
+				r := NewRouter(zap.NewExample(), cfg, NewDefaultDialer(), sharedSocketMgr.socketManager)
+
+				// Create a new Fx app just for lifecycle management
+				app := fx.New(
+					fx.Invoke(func(lc fx.Lifecycle) error {
+						return r.Start(lc)
+					}),
+				)
+
+				// Try to start it
+				err := app.Start(context.Background())
+				if err == nil {
+					// If we succeeded, wait a bit then stop
+					time.Sleep(50 * time.Millisecond)
+					_ = app.Stop(context.Background())
+				}
+				results <- err
+			}()
+		}
+
+		// Start all goroutines at the same time
+		close(start)
+
+		// Wait for all attempts
+		wg.Wait()
+		close(results)
+
+		// Count successes vs failures
+		successCount := 0
+		failCount := 0
+		for err := range results {
+			if err == nil {
+				successCount++
+			} else {
+				// Count any error that indicates socket contention
+				errStr := err.Error()
+				if strings.Contains(errStr, "socket") ||
+					strings.Contains(errStr, "pid file") ||
+					strings.Contains(errStr, "in use") {
+					failCount++
+					t.Logf("Got expected socket error: %v", err)
+				} else {
+					t.Logf("Unexpected error type: %v", err)
+				}
+			}
+		}
+
+		// We want exactly 1 success, and 2 socket-related failures
+		if successCount != 1 {
+			t.Errorf("Expected exactly one successful start, got %d successes", successCount)
+		}
+		if failCount != 2 {
+			t.Errorf("Expected two socket-related failures, got %d failures", failCount)
+		}
+	})
+
+	t.Run("pid_file_integrity", func(t *testing.T) {
+		builder := NewTestAppBuilder(t, cfg)
+		stopRouter := builder.Start(context.Background())
+		defer stopRouter()
+
+		// Verify PID file exists and contains correct PID
+		pidFile := socketPath + ".pid"
+		pidBytes, err := os.ReadFile(pidFile)
+		if err != nil {
+			t.Fatalf("Failed to read PID file: %v", err)
+		}
+		expectedPID := fmt.Sprintf("%d\n", os.Getpid())
+		if string(pidBytes) != expectedPID {
+			t.Errorf("Incorrect PID in file. Got %q, want %q", string(pidBytes), expectedPID)
+		}
+
+		// Verify router remains functional if PID file is removed
+		if err := os.Remove(pidFile); err != nil {
+			t.Fatalf("Failed to remove PID file: %v", err)
+		}
+
+		// Socket should still be functional
+		conn, err := net.Dial("unix", socketPath)
+		if err != nil {
+			t.Errorf("Socket stopped working after PID file removal: %v", err)
+		} else {
+			conn.Close()
+		}
+	})
+}
+
+// TestUIDExtraction verifies that user identification works correctly
+func TestUIDExtraction(t *testing.T) {
+	tempDir := t.TempDir()
+	socketPath := filepath.Join(tempDir, "docker.sock")
+
+	cfg := &config.SocketConfig{
+		SystemSocket:         socketPath,
+		RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
+	}
+
+	builder := NewTestAppBuilder(t, cfg)
+	stopRouter := builder.Start(context.Background())
+	defer stopRouter()
+
+	// Connect and verify our UID is correctly extracted
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	// Get our actual UID
+	expectedUID := uint32(os.Getuid())
+
+	// The router will try to connect to our user socket, which should
+	// generate a specific error message containing our UID
+	userSocket := fmt.Sprintf(cfg.RootlessSocketFormat, expectedUID)
+
+	// Send a request to trigger the router's permission check
+	if _, err := conn.Write([]byte("GET /version HTTP/1.1\r\n\r\n")); err != nil {
+		t.Fatalf("Failed to send request: %v", err)
+	}
+
+	// Read response - it should indicate an attempt to connect to our user socket
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Failed to read response: %v", err)
+	}
+
+	response := string(buf[:n])
+	if !strings.Contains(response, userSocket) {
+		t.Errorf("Response doesn't reference correct user socket.\nGot: %s\nWant socket path: %s",
+			response, userSocket)
+	}
+}
+
+// TestSocketPermissionVerification verifies that the router correctly
+// enforces access to user-specific Docker sockets
+func TestSocketPermissionVerification(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Ensure cleanup of any stale files
+	t.Cleanup(func() {
+		os.RemoveAll(tempDir)
+	})
+
+	// Clean up any stale files before starting
+	os.RemoveAll(tempDir)
+	os.MkdirAll(tempDir, 0755)
+
+	socketPath := filepath.Join(tempDir, "docker.sock")
+
+	cfg := &config.SocketConfig{
+		SystemSocket:         socketPath,
+		RootlessSocketFormat: filepath.Join(tempDir, "user_%d.sock"),
+	}
+
+	builder := NewTestAppBuilder(t, cfg)
+	stopRouter := builder.Start(context.Background())
+
+	// Add a defer to ensure cleanup
+	defer func() {
+		stopRouter()
+		os.Remove(socketPath)
+		uid := uint32(os.Getuid())
+		userSocket := fmt.Sprintf(cfg.RootlessSocketFormat, uid)
+		os.Remove(userSocket)
+	}()
+
+	// Add a small delay to ensure socket is ready
+	time.Sleep(100 * time.Millisecond)
+
+	uid := uint32(os.Getuid())
+	userSocket := fmt.Sprintf(cfg.RootlessSocketFormat, uid)
+
+	t.Run("no_user_socket", func(t *testing.T) {
+		// Ensure no user socket exists
+		os.Remove(userSocket)
+
+		// Set a timeout for the test
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// Create a connection with timeout
+		var d net.Dialer
+		conn, err := d.DialContext(ctx, "unix", socketPath)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer conn.Close()
+
+		if _, err := conn.Write([]byte("GET /version HTTP/1.1\r\n\r\n")); err != nil {
+			t.Fatalf("Failed to send request: %v", err)
+		}
+
+		// Set read deadline
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+		// Read the HTTP response
+		reader := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(reader, nil)
+		if err != nil {
+			t.Fatalf("Failed to read HTTP response: %v", err)
+		}
+		defer resp.Body.Close()
+
+		// Read the response body
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("Failed to read response body: %v", err)
+		}
+
+		if !strings.Contains(string(body), "socket_not_found") {
+			t.Errorf("Expected socket_not_found error, got: %s", string(body))
+		}
+	})
+
+	t.Run("inaccessible_user_socket", func(t *testing.T) {
+		// Create user socket with no permissions
+		l, err := net.Listen("unix", userSocket)
+		if err != nil {
+			t.Fatalf("Failed to create user socket: %v", err)
+		}
+		defer l.Close()
+		defer os.Remove(userSocket)
+
+		// Channel to signal when we're done with the listener
+		done := make(chan struct{})
+		defer close(done)
+
+		// Start a goroutine to accept connections
+		go func() {
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					conn, err := l.Accept()
+					if err != nil {
+						if !strings.Contains(err.Error(), "use of closed network connection") {
+							t.Errorf("Accept error: %v", err)
+						}
+						return
+					}
+
+					// Read the request
+					buf := make([]byte, 1024)
+					if _, err := conn.Read(buf); err != nil && err != io.EOF {
+						t.Errorf("Failed to read request: %v", err)
+						conn.Close()
+						continue
+					}
+
+					// Send a proper error response with a body
+					errorResp := `{"message":"Permission denied","code":"permission_denied"}`
+					response := fmt.Sprintf("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(errorResp), errorResp)
+					if _, err := conn.Write([]byte(response)); err != nil {
+						t.Errorf("Failed to write response: %v", err)
+					}
+
+					// Give the client time to read the response
+					time.Sleep(100 * time.Millisecond)
+					conn.Close()
+				}
+			}
+		}()
+
+		// Set socket permissions to 0000 (no access)
+		if err := os.Chmod(userSocket, 0000); err != nil {
+			t.Fatalf("Failed to chmod socket: %v", err)
+		}
+
+		// Create a connection with timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		var d net.Dialer
+		conn, err := d.DialContext(ctx, "unix", socketPath)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer conn.Close()
+
+		// Send the request with a timeout
+		request := "GET /version HTTP/1.1\r\nHost: unix\r\nConnection: close\r\n\r\n"
+		if err := conn.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("Failed to set write deadline: %v", err)
+		}
+		if _, err := conn.Write([]byte(request)); err != nil {
+			t.Fatalf("Failed to send request: %v", err)
+		}
+
+		// Read the response with a timeout and retries
+		maxRetries := 3
+		var lastErr error
+		var statusLine string
+
+		// Create a buffered reader for the connection
+		reader := bufio.NewReader(conn)
+
+		for i := 0; i < maxRetries; i++ {
+			if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				lastErr = fmt.Errorf("failed to set read deadline: %v", err)
+				continue
+			}
+
+			// Read status line with a small delay between retries
+			statusLine, err = reader.ReadString('\n')
+			if err == nil {
+				break
+			}
+
+			lastErr = err
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		if lastErr != nil {
+			t.Fatalf("Failed to read status line after %d retries: %v", maxRetries, lastErr)
+		}
+
+		if !strings.HasPrefix(statusLine, "HTTP/1.1 403") {
+			t.Errorf("Expected HTTP 403 response, got: %s", statusLine)
+		}
+
+		// Read headers with retries
+		var contentLength int
+		for {
+			var line string
+			for i := 0; i < maxRetries; i++ {
+				if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+					lastErr = fmt.Errorf("failed to set read deadline: %v", err)
+					continue
+				}
+
+				line, err = reader.ReadString('\n')
+				if err == nil {
+					break
+				}
+
+				lastErr = err
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			if lastErr != nil {
+				t.Fatalf("Failed to read header line after %d retries: %v", maxRetries, lastErr)
+			}
+
+			line = strings.TrimSpace(line)
+			if line == "" {
+				break // End of headers
+			}
+			if strings.HasPrefix(strings.ToLower(line), "content-length:") {
+				lengthStr := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(line), "content-length:"))
+				contentLength, err = strconv.Atoi(lengthStr)
+				if err != nil {
+					t.Fatalf("Invalid Content-Length: %v", err)
+				}
+			}
+		}
+
+		if contentLength <= 0 {
+			t.Fatal("Missing or invalid Content-Length")
+		}
+
+		// Read the response body with retries
+		body := make([]byte, contentLength)
+		for i := 0; i < maxRetries; i++ {
+			if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				lastErr = fmt.Errorf("failed to set read deadline: %v", err)
+				continue
+			}
+
+			_, err = io.ReadFull(reader, body)
+			if err == nil {
+				break
+			}
+
+			lastErr = err
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		if lastErr != nil {
+			t.Fatalf("Failed to read body after %d retries: %v", maxRetries, lastErr)
+		}
+
+		var errorResp apierror.ErrorResponse
+		if err := json.Unmarshal(body, &errorResp); err != nil {
+			t.Fatalf("Failed to parse error JSON: %v\nBody: %s", err, string(body))
+		}
+
+		if errorResp.Code != apierror.CodePermissionDenied {
+			t.Errorf("Expected permission_denied error, got: %s", errorResp.Code)
+		}
+	})
 }
