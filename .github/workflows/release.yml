@@ -18,7 +18,7 @@ jobs:
           check-latest: true
 
       - name: Run tests
-        run: go test -v -race ./...
+        run: sudo go test -v -race ./...
 
       - name: Upload test results
         if: always()
