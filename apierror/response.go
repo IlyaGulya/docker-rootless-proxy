@@ -1,19 +1,16 @@
 package apierror
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
-	"time"
+	"net/http"
 )
 
 // WriteError writes a JSON-formatted error response to the connection
 func WriteError(conn net.Conn, message string, code string) error {
-	// Set a short timeout for writing the error response
-	if err := conn.SetWriteDeadline(time.Now().Add(1 * time.Second)); err != nil {
-		return fmt.Errorf("failed to set write deadline: %w", err)
-	}
-
 	resp := ErrorResponse{
 		Message: message,
 		Code:    code,
@@ -24,16 +21,23 @@ func WriteError(conn net.Conn, message string, code string) error {
 		return fmt.Errorf("failed to marshal error response: %w", err)
 	}
 
-	// Format as HTTP response
-	httpResp := fmt.Sprintf("HTTP/1.1 500 Internal Server Error\r\n"+
-		"Content-Type: application/json\r\n"+
-		"Content-Length: %d\r\n"+
-		"\r\n"+
-		"%s", len(data), data)
+	// Create HTTP response using net/http
+	httpResp := &http.Response{
+		Status:     "500 Internal Server Error",
+		StatusCode: http.StatusInternalServerError,
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header: http.Header{
+			"Content-Type":   []string{"application/json"},
+			"Content-Length": []string{fmt.Sprintf("%d", len(data))},
+		},
+		Body:          io.NopCloser(bytes.NewReader(data)),
+		ContentLength: int64(len(data)),
+	}
 
-	// Write the full response in one call to avoid partial writes
-	if _, err := conn.Write([]byte(httpResp)); err != nil {
-		return fmt.Errorf("failed to write error response: %w", err)
+	// Write the response
+	if err := httpResp.Write(conn); err != nil {
+		return fmt.Errorf("failed to write response: %w", err)
 	}
 
 	return nil

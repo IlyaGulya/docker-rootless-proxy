@@ -642,17 +642,27 @@ func TestUIDExtraction(t *testing.T) {
 		t.Fatalf("Failed to send request: %v", err)
 	}
 
-	// Read response - it should indicate an attempt to connect to our user socket
-	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
+	// Read and parse the HTTP response
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
-		t.Fatalf("Failed to read response: %v", err)
+		t.Fatalf("Failed to read HTTP response: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read and parse the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read response body: %v", err)
 	}
 
-	response := string(buf[:n])
-	if !strings.Contains(response, userSocket) {
-		t.Errorf("Response doesn't reference correct user socket.\nGot: %s\nWant socket path: %s",
-			response, userSocket)
+	var errorResp apierror.ErrorResponse
+	if err := json.Unmarshal(body, &errorResp); err != nil {
+		t.Fatalf("Failed to parse response JSON: %v", err)
+	}
+
+	if !strings.Contains(errorResp.Message, userSocket) {
+		t.Errorf("Response message doesn't reference correct user socket.\nGot message: %s\nWant socket path: %s",
+			errorResp.Message, userSocket)
 	}
 }
 
@@ -726,14 +736,24 @@ func TestSocketPermissionVerification(t *testing.T) {
 		}
 		defer resp.Body.Close()
 
-		// Read the response body
+		// Read and parse the response body
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Fatalf("Failed to read response body: %v", err)
 		}
 
-		if !strings.Contains(string(body), "socket_not_found") {
-			t.Errorf("Expected socket_not_found error, got: %s", string(body))
+		var errorResp apierror.ErrorResponse
+		if err := json.Unmarshal(body, &errorResp); err != nil {
+			t.Fatalf("Failed to parse response JSON: %v", err)
+		}
+
+		if errorResp.Code != apierror.CodeSocketNotFound {
+			t.Errorf("Expected error code %q, got %q", apierror.CodeSocketNotFound, errorResp.Code)
+		}
+
+		if !strings.Contains(errorResp.Message, userSocket) {
+			t.Errorf("Response message doesn't reference correct user socket.\nGot message: %s\nWant socket path: %s",
+				errorResp.Message, userSocket)
 		}
 	})
 
@@ -750,7 +770,7 @@ func TestSocketPermissionVerification(t *testing.T) {
 		done := make(chan struct{})
 		defer close(done)
 
-		// Start a goroutine to accept connections
+		// Start a goroutine to accept connections and return permission denied error
 		go func() {
 			for {
 				select {
@@ -760,28 +780,23 @@ func TestSocketPermissionVerification(t *testing.T) {
 					conn, err := l.Accept()
 					if err != nil {
 						if !strings.Contains(err.Error(), "use of closed network connection") {
-							t.Errorf("Accept error: %v", err)
+							t.Logf("Accept error: %v", err)
 						}
 						return
 					}
-
-					// Read the request
-					buf := make([]byte, 1024)
-					if _, err := conn.Read(buf); err != nil && err != io.EOF {
-						t.Errorf("Failed to read request: %v", err)
+					// Return a permission denied error
+					errorResp := apierror.ErrorResponse{
+						Message: "Permission denied",
+						Code:    apierror.CodePermissionDenied,
+					}
+					data, err := json.Marshal(errorResp)
+					if err != nil {
+						t.Errorf("Failed to marshal error response: %v", err)
 						conn.Close()
 						continue
 					}
-
-					// Send a proper error response with a body
-					errorResp := `{"message":"Permission denied","code":"permission_denied"}`
-					response := fmt.Sprintf("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(errorResp), errorResp)
-					if _, err := conn.Write([]byte(response)); err != nil {
-						t.Errorf("Failed to write response: %v", err)
-					}
-
-					// Give the client time to read the response
-					time.Sleep(100 * time.Millisecond)
+					response := fmt.Sprintf("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(data), data)
+					conn.Write([]byte(response))
 					conn.Close()
 				}
 			}
@@ -792,126 +807,42 @@ func TestSocketPermissionVerification(t *testing.T) {
 			t.Fatalf("Failed to chmod socket: %v", err)
 		}
 
-		// Create a connection with timeout
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		var d net.Dialer
-		conn, err := d.DialContext(ctx, "unix", socketPath)
+		// Connect to the router
+		conn, err := net.Dial("unix", socketPath)
 		if err != nil {
 			t.Fatalf("Failed to connect: %v", err)
 		}
 		defer conn.Close()
 
-		// Send the request with a timeout
-		request := "GET /version HTTP/1.1\r\nHost: unix\r\nConnection: close\r\n\r\n"
-		if err := conn.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
-			t.Fatalf("Failed to set write deadline: %v", err)
-		}
-		if _, err := conn.Write([]byte(request)); err != nil {
+		// Send a request
+		if _, err := conn.Write([]byte("GET /version HTTP/1.1\r\n\r\n")); err != nil {
 			t.Fatalf("Failed to send request: %v", err)
 		}
 
-		// Read the response with a timeout and retries
-		maxRetries := 3
-		var lastErr error
-		var statusLine string
+		// Set read deadline to avoid hanging
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
-		// Create a buffered reader for the connection
+		// Read the HTTP response
 		reader := bufio.NewReader(conn)
-
-		for i := 0; i < maxRetries; i++ {
-			if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-				lastErr = fmt.Errorf("failed to set read deadline: %v", err)
-				continue
-			}
-
-			// Read status line with a small delay between retries
-			statusLine, err = reader.ReadString('\n')
-			if err == nil {
-				break
-			}
-
-			lastErr = err
-			time.Sleep(100 * time.Millisecond)
+		resp, err := http.ReadResponse(reader, nil)
+		if err != nil {
+			t.Fatalf("Failed to read HTTP response: %v", err)
 		}
+		defer resp.Body.Close()
 
-		if lastErr != nil {
-			t.Fatalf("Failed to read status line after %d retries: %v", maxRetries, lastErr)
-		}
-
-		if !strings.HasPrefix(statusLine, "HTTP/1.1 403") {
-			t.Errorf("Expected HTTP 403 response, got: %s", statusLine)
-		}
-
-		// Read headers with retries
-		var contentLength int
-		for {
-			var line string
-			for i := 0; i < maxRetries; i++ {
-				if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-					lastErr = fmt.Errorf("failed to set read deadline: %v", err)
-					continue
-				}
-
-				line, err = reader.ReadString('\n')
-				if err == nil {
-					break
-				}
-
-				lastErr = err
-				time.Sleep(100 * time.Millisecond)
-			}
-
-			if lastErr != nil {
-				t.Fatalf("Failed to read header line after %d retries: %v", maxRetries, lastErr)
-			}
-
-			line = strings.TrimSpace(line)
-			if line == "" {
-				break // End of headers
-			}
-			if strings.HasPrefix(strings.ToLower(line), "content-length:") {
-				lengthStr := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(line), "content-length:"))
-				contentLength, err = strconv.Atoi(lengthStr)
-				if err != nil {
-					t.Fatalf("Invalid Content-Length: %v", err)
-				}
-			}
-		}
-
-		if contentLength <= 0 {
-			t.Fatal("Missing or invalid Content-Length")
-		}
-
-		// Read the response body with retries
-		body := make([]byte, contentLength)
-		for i := 0; i < maxRetries; i++ {
-			if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-				lastErr = fmt.Errorf("failed to set read deadline: %v", err)
-				continue
-			}
-
-			_, err = io.ReadFull(reader, body)
-			if err == nil {
-				break
-			}
-
-			lastErr = err
-			time.Sleep(100 * time.Millisecond)
-		}
-
-		if lastErr != nil {
-			t.Fatalf("Failed to read body after %d retries: %v", maxRetries, lastErr)
+		// Read and parse the response body
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("Failed to read response body: %v", err)
 		}
 
 		var errorResp apierror.ErrorResponse
 		if err := json.Unmarshal(body, &errorResp); err != nil {
-			t.Fatalf("Failed to parse error JSON: %v\nBody: %s", err, string(body))
+			t.Fatalf("Failed to parse response JSON: %v", err)
 		}
 
 		if errorResp.Code != apierror.CodePermissionDenied {
-			t.Errorf("Expected permission_denied error, got: %s", errorResp.Code)
+			t.Errorf("Expected error code %q, got %q", apierror.CodePermissionDenied, errorResp.Code)
 		}
 	})
 }

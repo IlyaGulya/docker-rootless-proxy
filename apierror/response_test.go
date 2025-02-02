@@ -1,16 +1,19 @@
 package apierror
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
+	"io"
 	"net"
-	"strings"
+	"net/http"
 	"testing"
 	"time"
 )
 
 type mockConn struct {
 	net.Conn
-	written []byte
+	buffer bytes.Buffer
 }
 
 // Provide a no-op or a mock implementation:
@@ -25,8 +28,7 @@ func (m *mockConn) SetDeadline(t time.Time) error {
 }
 
 func (m *mockConn) Write(p []byte) (n int, err error) {
-	m.written = append(m.written, p...)
-	return len(p), nil
+	return m.buffer.Write(p)
 }
 
 func (m *mockConn) Close() error { return nil }
@@ -64,31 +66,37 @@ func TestWriteError(t *testing.T) {
 				t.Fatalf("WriteError() error = %v", err)
 			}
 
-			// Verify HTTP response format
-			response := string(conn.written)
-			if !strings.HasPrefix(response, "HTTP/1.1 500 Internal Server Error\r\n") {
-				t.Error("Response missing HTTP status line")
+			// Parse the HTTP response
+			resp, err := http.ReadResponse(bufio.NewReader(&conn.buffer), nil)
+			if err != nil {
+				t.Fatalf("Failed to parse HTTP response: %v", err)
 			}
-			if !strings.Contains(response, "Content-Type: application/json") {
-				t.Error("Response missing Content-Type header")
+			defer resp.Body.Close()
+
+			// Verify response status and headers
+			if resp.StatusCode != http.StatusInternalServerError {
+				t.Errorf("StatusCode = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json", ct)
 			}
 
-			// Extract and parse JSON body
-			parts := strings.Split(response, "\r\n\r\n")
-			if len(parts) != 2 {
-				t.Fatal("Invalid response format")
+			// Read and parse response body
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("Failed to read response body: %v", err)
 			}
 
-			var resp ErrorResponse
-			if err := json.Unmarshal([]byte(parts[1]), &resp); err != nil {
+			var errorResp ErrorResponse
+			if err := json.Unmarshal(body, &errorResp); err != nil {
 				t.Fatalf("Failed to parse response JSON: %v", err)
 			}
 
-			if resp.Message != tt.wantMessage {
-				t.Errorf("Message = %q, want %q", resp.Message, tt.wantMessage)
+			if errorResp.Message != tt.wantMessage {
+				t.Errorf("Message = %q, want %q", errorResp.Message, tt.wantMessage)
 			}
-			if resp.Code != tt.wantCode {
-				t.Errorf("Code = %q, want %q", resp.Code, tt.wantCode)
+			if errorResp.Code != tt.wantCode {
+				t.Errorf("Code = %q, want %q", errorResp.Code, tt.wantCode)
 			}
 		})
 	}
